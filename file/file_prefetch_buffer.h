@@ -15,6 +15,7 @@
 #include <sstream>
 #include <string>
 
+#include "file/compaction_io_experiment.h"
 #include "file/random_access_file_reader.h"
 #include "file/readahead_file_info.h"
 #include "file_util.h"
@@ -65,6 +66,10 @@ struct BufferInfo {
     buffer_.Clear();
     initial_end_offset_ = 0;
     async_req_len_ = 0;
+    compaction_io_experiment_start_micros_ = 0;
+    compaction_io_experiment_completion_micros_ = 0;
+    compaction_io_experiment_read_in_progress_ = false;
+    compaction_io_experiment_ready_ = false;
   }
 
   AlignedBuffer buffer_;
@@ -78,6 +83,11 @@ struct BufferInfo {
   // async_read_in_progress can be used as mutex. Callback can update the buffer
   // and its size but async_read_in_progress is only set by main thread.
   bool async_read_in_progress_ = false;
+
+  uint64_t compaction_io_experiment_start_micros_ = 0;
+  uint64_t compaction_io_experiment_completion_micros_ = 0;
+  bool compaction_io_experiment_read_in_progress_ = false;
+  bool compaction_io_experiment_ready_ = false;
 
   // io_handle is allocated and used by underlying file system in case of
   // asynchronous reads.
@@ -189,7 +199,8 @@ class FilePrefetchBuffer {
       bool track_min_offset = false, FileSystem* fs = nullptr,
       SystemClock* clock = nullptr, Statistics* stats = nullptr,
       const std::function<void(bool, uint64_t&, uint64_t&)>& cb = nullptr,
-      FilePrefetchBufferUsage usage = FilePrefetchBufferUsage::kUnknown)
+      FilePrefetchBufferUsage usage = FilePrefetchBufferUsage::kUnknown,
+      bool compaction_io_experiment_enabled = false)
       : readahead_size_(readahead_params.initial_readahead_size),
         initial_auto_readahead_size_(readahead_params.initial_readahead_size),
         max_readahead_size_(readahead_params.max_readahead_size),
@@ -208,6 +219,8 @@ class FilePrefetchBuffer {
         stats_(stats),
         usage_(usage),
         readaheadsize_cb_(cb),
+        compaction_io_experiment_enabled_(
+            compaction_io_experiment_enabled),
         num_buffers_(readahead_params.num_buffers) {
     assert((num_file_reads_ >= num_file_reads_for_auto_readahead_ + 1) ||
            (num_file_reads_ == 0));
@@ -545,6 +558,14 @@ class FilePrefetchBuffer {
   }
 
   void DestroyAndClearIOHandle(BufferInfo* buf) {
+    if (buf->compaction_io_experiment_read_in_progress_) {
+      if (auto* experiment = CompactionIOExperiment::Active();
+          experiment != nullptr) {
+        experiment->RecordAsynchronousReadAborted();
+      }
+      buf->compaction_io_experiment_read_in_progress_ = false;
+      buf->compaction_io_experiment_ready_ = false;
+    }
     if (buf->io_handle_ != nullptr && buf->del_fn_ != nullptr) {
       buf->del_fn_(buf->io_handle_);
       buf->io_handle_ = nullptr;
@@ -707,6 +728,8 @@ class FilePrefetchBuffer {
   FilePrefetchBufferUsage usage_;
 
   std::function<void(bool, uint64_t&, uint64_t&)> readaheadsize_cb_;
+
+  bool compaction_io_experiment_enabled_;
 
   // num_buffers_ is the number of buffers maintained by FilePrefetchBuffer to
   // prefetch the data at a time.

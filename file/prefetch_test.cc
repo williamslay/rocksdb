@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include "db/db_test_util.h"
+#include "file/compaction_io_experiment.h"
 #include "file/file_prefetch_buffer.h"
 #include "file/file_util.h"
 #include "rocksdb/file_system.h"
@@ -3710,13 +3711,16 @@ TEST_F(FilePrefetchBufferTest, ReadAsyncSyncFallbackOnNotSupported) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
 
+  CompactionIOExperiment experiment(2, SystemClock::Default().get());
   ReadaheadParams readahead_params;
   readahead_params.initial_readahead_size = 16384;
   readahead_params.max_readahead_size = 16384;
   readahead_params.num_buffers = 2;
 
   FilePrefetchBuffer fpb(readahead_params, /*enable=*/true,
-                         /*track_min_offset=*/false, fs());
+                         /*track_min_offset=*/false, fs(), nullptr, nullptr,
+                         nullptr, FilePrefetchBufferUsage::kUnknown,
+                         /*compaction_io_experiment_enabled=*/true);
 
   Slice result;
   Status s;
@@ -3724,6 +3728,54 @@ TEST_F(FilePrefetchBufferTest, ReadAsyncSyncFallbackOnNotSupported) {
   ASSERT_OK(s);
   ASSERT_EQ(result.size(), 4096);
   ASSERT_EQ(memcmp(result.data(), content.data(), 4096), 0);
+  EXPECT_NE(experiment.ToJson().find("\"read_count\":2"),
+            std::string::npos);
+  EXPECT_NE(experiment.ToJson().find("\"io_service_us\":{\"count\":0"),
+            std::string::npos);
+  EXPECT_NE(experiment.ToJson().find(
+                "\"sync_fallback_read_us\":{\"count\":2"),
+            std::string::npos);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(FilePrefetchBufferTest, CompactionExperimentUsesFixedAsyncRequestSpan) {
+  std::string fname = "compaction-fixed-async-request-span";
+  Random rand(0);
+  std::string content = rand.RandomString(2 * CompactionIOExperiment::kRequestSpan);
+  Write(fname, content);
+
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> r;
+  Read(fname, opts, &r);
+
+  std::vector<size_t> request_lengths;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FilePrefetchBuffer::ReadAsync:RequestLength", [&](void* arg) {
+        request_lengths.push_back(*static_cast<size_t*>(arg));
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CompactionIOExperiment experiment(2, SystemClock::Default().get());
+  ReadaheadParams readahead_params;
+  readahead_params.initial_readahead_size =
+      CompactionIOExperiment::kRequestSpan;
+  readahead_params.max_readahead_size = CompactionIOExperiment::kRequestSpan;
+  readahead_params.num_buffers = 2;
+  FilePrefetchBuffer fpb(
+      readahead_params, true, false, fs(), nullptr, nullptr, nullptr,
+      FilePrefetchBufferUsage::kUnknown, true);
+
+  Slice result;
+  Status s;
+  ASSERT_TRUE(
+      fpb.TryReadFromCache(IOOptions(), r.get(), 0, 4096, &result, &s, true));
+  ASSERT_OK(s);
+  ASSERT_FALSE(request_lengths.empty());
+  for (size_t request_length : request_lengths) {
+    EXPECT_EQ(request_length, CompactionIOExperiment::kRequestSpan);
+  }
 
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
@@ -4292,6 +4344,203 @@ TEST_P(FSBufferPrefetchTest, FSBufferPrefetchRandomized) {
       offset += len;
     }
   }
+}
+
+TEST(CompactionIOExperimentTest, AcceptsOnlyConfiguredDepths) {
+  for (uint64_t depth : {1u, 2u, 4u, 8u, 16u, 32u, 64u}) {
+    EXPECT_TRUE(CompactionIOExperiment::IsSupportedDepth(depth));
+  }
+  EXPECT_FALSE(CompactionIOExperiment::IsSupportedDepth(0));
+  EXPECT_FALSE(CompactionIOExperiment::IsSupportedDepth(3));
+  EXPECT_FALSE(CompactionIOExperiment::IsSupportedDepth(128));
+}
+
+TEST(CompactionIOExperimentTest, PreservesExistingTimingAndJsonFields) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  experiment.RecordConsumerPoll(10, 12, 14, 16, true);
+  experiment.RecordConsumerPoll(20, 10, 15, 30, false);
+
+  const std::string summary = experiment.ToJson();
+  EXPECT_NE(summary.find("\"request_span_bytes\":1048576"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"stall_count\":1"), std::string::npos);
+  EXPECT_NE(summary.find(
+                "\"overlap_us\":{\"count\":1,\"avg\":2.000000,\"stddev\":0.000000,"),
+            std::string::npos);
+  EXPECT_NE(
+      summary.find(
+          "\"exposed_io_us\":{\"count\":1,\"avg\":4.000000,\"stddev\":0.000000,"),
+      std::string::npos);
+}
+
+TEST(CompactionIOExperimentTest, RecordsCompletionBoundaryTotals) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  experiment.RecordConsumerPoll(100, 200, 150, 200, false);
+  experiment.RecordConsumerPoll(300, 350, 350, 380, true);
+  experiment.RecordConsumerPoll(500, 550, 600, 600, true);
+  experiment.RecordConsumerPoll(0, 0, 0, 0, true);
+  experiment.RecordConsumerPoll(700, 690, 680, 670, true);
+
+  const std::string summary = experiment.ToJson();
+  EXPECT_EQ(summary.front(), '{');
+  EXPECT_EQ(summary.back(), '}');
+  EXPECT_NE(summary.find("\"overlap_total_us\":150,"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"exposed_io_total_us\":80,"),
+            std::string::npos);
+  EXPECT_NE(summary.find(
+                "\"overlap_us\":{\"count\":3,\"avg\":50.000000,\"stddev\":0.000000,"),
+            std::string::npos);
+  EXPECT_NE(summary.find(
+                "\"exposed_io_us\":{\"count\":2,\"avg\":40.000000,\"stddev\":10.000000,"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"stall_count\":4,"), std::string::npos);
+  EXPECT_EQ(summary.find("nan"), std::string::npos);
+  EXPECT_EQ(summary.find("NaN"), std::string::npos);
+}
+
+TEST(CompactionIOExperimentTest, RejectsInvalidPollEndForTimingSamples) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  experiment.RecordConsumerPoll(10, 20, 30, 15, false);
+
+  const std::string summary = experiment.ToJson();
+  EXPECT_NE(summary.find("\"overlap_total_us\":0,"),
+            std::string::npos);
+  EXPECT_NE(summary.find(
+                "\"overlap_us\":{\"count\":0,\"avg\":0.000000,\"stddev\":0.000000,"),
+            std::string::npos);
+}
+
+TEST(CompactionIOExperimentTest, RejectsNonCausalTimingEnvelopes) {
+  struct TimingCase {
+    uint64_t issue;
+    uint64_t demand;
+    uint64_t completion;
+    uint64_t poll_end;
+    bool was_waiting;
+    uint64_t expected_overlap;
+    uint64_t expected_exposed;
+  };
+  const std::vector<TimingCase> cases = {
+      {20, 10, 30, 40, true, 0, 0},
+      {10, 20, 5, 30, true, 0, 0},
+      {10, 20, 40, 30, true, 0, 0},
+      {10, 40, 20, 30, true, 0, 0},
+      {10, 20, 15, 30, true, 5, 10},
+  };
+
+  for (const TimingCase& timing : cases) {
+    CompactionIOExperiment experiment(4, SystemClock::Default().get());
+    experiment.RecordConsumerPoll(timing.issue, timing.demand,
+                                  timing.completion, timing.poll_end,
+                                  timing.was_waiting);
+    const std::string summary = experiment.ToJson();
+    EXPECT_NE(summary.find("\"overlap_total_us\":" +
+                          std::to_string(timing.expected_overlap) + ","),
+              std::string::npos);
+    EXPECT_NE(summary.find("\"exposed_io_total_us\":" +
+                          std::to_string(timing.expected_exposed) + ","),
+              std::string::npos);
+  }
+}
+
+TEST(CompactionIOExperimentTest,
+     ReportsExactTotalsIndependentOfRoundedHistogramAverage) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  experiment.RecordConsumerPoll(10, 13, 12, 14, true);
+  experiment.RecordConsumerPoll(20, 23, 22, 24, true);
+  experiment.RecordConsumerPoll(30, 35, 33, 37, true);
+
+  const std::string summary = experiment.ToJson();
+  EXPECT_NE(summary.find("\"overlap_total_us\":7,"), std::string::npos);
+  EXPECT_NE(summary.find("\"exposed_io_total_us\":4,"),
+            std::string::npos);
+  EXPECT_NE(summary.find(
+                "\"overlap_us\":{\"count\":3,\"avg\":2.333333,\"stddev\":0.471405,\"p50\":"),
+            std::string::npos);
+  EXPECT_NE(summary.find(
+                "\"exposed_io_us\":{\"count\":3,\"avg\":1.333333,\"stddev\":0.471405,\"p50\":"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"p95\":"), std::string::npos);
+  EXPECT_NE(summary.find("\"p99\":"), std::string::npos);
+  EXPECT_NE(summary.find("\"max\":"), std::string::npos);
+}
+
+TEST(CompactionIOExperimentTest, ReportsMachineReadableMeasurements) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  experiment.RecordSynchronousRead(100, 90, 3);
+  experiment.RecordAsynchronousReadIssued(200);
+  experiment.RecordConsumerDemand(50);
+  experiment.RecordConsumerPoll(10, 12, 14, 16, true);
+  experiment.RecordConsumerPoll(20, 10, 15, 30, false);
+  experiment.RecordAsynchronousReadCompleted(180, 6);
+  experiment.RecordConsumed(50);
+
+  const std::string summary = experiment.ToJson();
+  EXPECT_NE(summary.find("\"depth\":4"), std::string::npos);
+  EXPECT_NE(summary.find("\"request_span_bytes\":1048576"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"read_count\":2"), std::string::npos);
+  EXPECT_NE(summary.find("\"read_bytes\":300"), std::string::npos);
+  EXPECT_NE(summary.find("\"prefetched_bytes\":270,"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"ready_bytes\":270"), std::string::npos);
+  EXPECT_NE(summary.find("\"consumed_bytes\":50"), std::string::npos);
+  EXPECT_NE(summary.find("\"demand_count\":1,"), std::string::npos);
+  EXPECT_NE(summary.find("\"demand_bytes\":50,"), std::string::npos);
+  EXPECT_NE(summary.find("\"stall_count\":1"), std::string::npos);
+  EXPECT_NE(summary.find("\"overlap_us\":{\"count\":1"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"max\":2.000000"), std::string::npos);
+  EXPECT_NE(summary.find("\"exposed_io_us\":{\"count\":1"),
+            std::string::npos);
+  EXPECT_NE(
+      summary.find(
+          "\"io_service_us\":{\"count\":1,\"avg\":6.000000,\"stddev\":0.000000,\"p50\":"),
+      std::string::npos);
+  EXPECT_NE(
+      summary.find(
+          "\"sync_fallback_read_us\":{\"count\":1,\"avg\":3.000000,\"stddev\":0.000000,\"p50\":"),
+      std::string::npos);
+  for (const char* histogram_name : {"io_service_us", "sync_fallback_read_us",
+                                     "overlap_us", "exposed_io_us"}) {
+    const std::string histogram_prefix =
+        std::string("\"") + histogram_name + "\":{";
+    const size_t histogram_start = summary.find(histogram_prefix);
+    ASSERT_NE(histogram_start, std::string::npos);
+    const size_t histogram_end = summary.find('}', histogram_start);
+    ASSERT_NE(histogram_end, std::string::npos);
+    for (const char* field_name : {"count", "avg", "stddev", "p50", "p95",
+                                   "p99", "max"}) {
+      const size_t field_start =
+          summary.find(std::string("\"") + field_name + "\":",
+                       histogram_start);
+      EXPECT_LT(field_start, histogram_end);
+    }
+  }
+  EXPECT_EQ(experiment.outstanding_async_reads(), 0);
+}
+
+TEST(CompactionIOExperimentTest, ReportsCompactionIntervalMeasurements) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  experiment.RecordCompactionInterval(1234, 567);
+
+  const std::string summary = experiment.ToJson();
+  EXPECT_NE(summary.find("\"t_compaction_us\":1234"), std::string::npos);
+  EXPECT_NE(summary.find("\"cpu_time_us\":567"), std::string::npos);
+}
+
+TEST(CompactionIOExperimentTest, RecordsAbortedAsyncReadsWithoutUnderflow) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  experiment.RecordAsynchronousReadIssued(1024);
+  experiment.RecordAsynchronousReadAborted();
+
+  const std::string summary = experiment.ToJson();
+  EXPECT_NE(summary.find("\"read_count\":1"), std::string::npos);
+  EXPECT_NE(summary.find("\"outstanding_async_reads\":0"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"io_service_us\":{\"count\":0"),
+            std::string::npos);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
