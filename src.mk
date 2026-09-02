@@ -124,6 +124,7 @@ LIB_SOURCES =                                                   \
   env/io_posix.cc                                               \
   env/mock_env.cc                                               \
   env/unique_id_gen.cc                                          \
+  file/compaction_io_experiment.cc                              \
   file/delete_scheduler.cc                                      \
   file/file_prefetch_buffer.cc                                  \
   file/file_util.cc                                             \
@@ -619,6 +620,7 @@ TEST_MAIN_SOURCES =                                                     \
   tools/block_cache_analyzer/block_cache_trace_analyzer_test.cc         \
   tools/io_tracer_parser_test.cc                                        \
   tools/ldb_cmd_test.cc                                                 \
+  tools/db_bench_tool_test.cc                                           \
   tools/reduce_levels_test.cc                                           \
   tools/sst_dump_test.cc                                                \
   tools/trace_analyzer_test.cc                                          \

@@ -135,6 +135,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "env/io_posix.cc",
         "env/mock_env.cc",
         "env/unique_id_gen.cc",
+        "file/compaction_io_experiment.cc",
         "file/delete_scheduler.cc",
         "file/file_prefetch_buffer.cc",
         "file/file_util.cc",
@@ -4789,6 +4790,12 @@ cpp_unittest_wrapper(name="db_basic_test",
             srcs=["db/db_basic_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="db_bench_tool_test",
+            srcs=["tools/db_bench_tool_test.cc"],
+            deps=[":db_bench", ":rocksdb_test_lib"],
+            extra_compiler_flags=[], env={"ROCKSDB_DB_BENCH_PATH": "$(location :db_bench)"})
 
 
 cpp_unittest_wrapper(name="db_blob_basic_test",

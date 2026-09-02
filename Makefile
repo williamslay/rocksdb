@@ -2038,8 +2038,10 @@ options_settable_test: $(OBJ_DIR)/options/options_settable_test.o $(TEST_LIBRARY
 options_util_test: $(OBJ_DIR)/utilities/options/options_util_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
-db_bench_tool_test: $(OBJ_DIR)/tools/db_bench_tool_test.o $(BENCH_OBJECTS) $(TEST_LIBRARY) $(LIBRARY)
+db_bench_tool_test: $(OBJ_DIR)/tools/db_bench_tool_test.o $(BENCH_OBJECTS) $(TEST_LIBRARY) $(LIBRARY) | db_bench
 	$(AM_LINK)
+
+$(OBJ_DIR)/tools/db_bench_tool_test.o: CXXFLAGS += -DROCKSDB_DB_BENCH_PATH=\"$(CURDIR)/db_bench\"
 
 trace_analyzer_test: $(OBJ_DIR)/tools/trace_analyzer_test.o $(ANALYZE_OBJECTS) $(TOOLS_LIBRARY) $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)

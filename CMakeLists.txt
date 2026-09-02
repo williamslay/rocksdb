@@ -874,6 +874,7 @@ set(SOURCES
         env/fs_remap.cc
         env/mock_env.cc
         env/unique_id_gen.cc
+        file/compaction_io_experiment.cc
         file/delete_scheduler.cc
         file/file_prefetch_buffer.cc
         file/file_util.cc
@@ -1726,6 +1727,32 @@ if(WITH_TESTS)
       endif()
   endforeach(sourcefile ${TESTS})
 
+  if(WITH_BENCHMARK_TOOLS)
+    add_executable(db_bench_tool_test${ARTIFACT_SUFFIX}
+        tools/db_bench_tool_test.cc
+        tools/db_bench_tool.cc
+        tools/tool_hooks.cc
+        tools/simulated_hybrid_file_system.cc)
+    target_link_libraries(db_bench_tool_test${ARTIFACT_SUFFIX}
+        testutillib${ARTIFACT_SUFFIX} testharness gtest ${THIRDPARTY_LIBS}
+        ${ROCKSDB_LIB})
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.18)
+      gtest_discover_tests(db_bench_tool_test${ARTIFACT_SUFFIX}
+                           DISCOVERY_TIMEOUT 120
+                           DISCOVERY_MODE PRE_TEST
+                           PROPERTIES
+                           ENVIRONMENT
+                           "ROCKSDB_DB_BENCH_PATH=$<TARGET_FILE:db_bench${ARTIFACT_SUFFIX}>")
+    else()
+      gtest_discover_tests(db_bench_tool_test${ARTIFACT_SUFFIX}
+                           DISCOVERY_TIMEOUT 120
+                           PROPERTIES
+                           ENVIRONMENT
+                           "ROCKSDB_DB_BENCH_PATH=$<TARGET_FILE:db_bench${ARTIFACT_SUFFIX}>")
+    endif()
+    add_dependencies(rocksdb_check db_bench_tool_test${ARTIFACT_SUFFIX})
+  endif()
+
   if(WIN32)
     # C executables must link to a shared object
     if(ROCKSDB_BUILD_SHARED)
@@ -1754,6 +1781,11 @@ if(WITH_BENCHMARK_TOOLS)
     tools/db_bench_tool.cc)
   target_link_libraries(db_bench${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+
+  if(TARGET db_bench_tool_test${ARTIFACT_SUFFIX})
+    add_dependencies(db_bench_tool_test${ARTIFACT_SUFFIX}
+                     db_bench${ARTIFACT_SUFFIX})
+  endif()
 
   add_executable(cache_bench${ARTIFACT_SUFFIX}
     cache/cache_bench.cc
