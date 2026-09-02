@@ -31,7 +31,7 @@ unittests_template = """
 cpp_unittest_wrapper(name="{test_name}",
             srcs=["{test_cc}"],
             deps={deps},
-            extra_compiler_flags={extra_compiler_flags})
+            extra_compiler_flags={extra_compiler_flags}{test_env})
 
 """
 

@@ -329,6 +329,14 @@ def generate_buck(repo_path, deps_map):
                 continue
 
             test_target_name = test if not target_alias else test + "_" + target_alias
+            test_deps = deps["extra_deps"] + (
+                [":db_bench"] if test == "db_bench_tool_test" else []
+            )
+            test_env = (
+                ', env={"ROCKSDB_DB_BENCH_PATH": "$(location :db_bench)"}'
+                if test == "db_bench_tool_test"
+                else ""
+            )
 
             if test in _EXPORTED_TEST_LIBS:
                 test_library = "%s_lib" % test_target_name
@@ -341,23 +349,26 @@ def generate_buck(repo_path, deps_map):
                 BUCK.register_test(
                     test_target_name,
                     test_src,
-                    deps=json.dumps(deps["extra_deps"] + [":" + test_library]),
+                    deps=json.dumps(test_deps + [":" + test_library]),
                     extra_compiler_flags=json.dumps(deps["extra_compiler_flags"]),
+                    test_env=test_env,
                 )
             else:
                 if with_faiss:
                     BUCK.register_test(
                         test_target_name,
                         test_src,
-                        deps=json.dumps(deps["extra_deps"] + [":rocksdb_with_faiss_test_lib"]),
+                        deps=json.dumps(test_deps + [":rocksdb_with_faiss_test_lib"]),
                         extra_compiler_flags=json.dumps(deps["extra_compiler_flags"]),
+                        test_env=test_env,
                     )
                 else:
                     BUCK.register_test(
                         test_target_name,
                         test_src,
-                        deps=json.dumps(deps["extra_deps"] + [":rocksdb_test_lib"]),
+                        deps=json.dumps(test_deps + [":rocksdb_test_lib"]),
                         extra_compiler_flags=json.dumps(deps["extra_compiler_flags"]),
+                        test_env=test_env,
                     )
     BUCK.export_file("tools/db_crashtest.py")
     BUCK.export_file("tools/fault_injection_log_parser.py")
