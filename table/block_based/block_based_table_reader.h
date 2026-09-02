@@ -907,20 +907,24 @@ struct BlockBasedTable::Rep {
       const ReadaheadParams& readahead_params,
       std::unique_ptr<FilePrefetchBuffer>* fpb,
       const std::function<void(bool, uint64_t&, uint64_t&)>& readaheadsize_cb,
-      FilePrefetchBufferUsage usage) const {
+      FilePrefetchBufferUsage usage,
+      bool compaction_io_experiment_enabled = false) const {
     fpb->reset(new FilePrefetchBuffer(
         readahead_params, !ioptions.allow_mmap_reads /* enable */,
         false /* track_min_offset */, ioptions.fs.get(), ioptions.clock,
-        ioptions.stats, readaheadsize_cb, usage));
+        ioptions.stats, readaheadsize_cb, usage,
+        compaction_io_experiment_enabled));
   }
 
   void CreateFilePrefetchBufferIfNotExists(
       const ReadaheadParams& readahead_params,
       std::unique_ptr<FilePrefetchBuffer>* fpb,
       const std::function<void(bool, uint64_t&, uint64_t&)>& readaheadsize_cb,
-      FilePrefetchBufferUsage usage = FilePrefetchBufferUsage::kUnknown) const {
+      FilePrefetchBufferUsage usage = FilePrefetchBufferUsage::kUnknown,
+      bool compaction_io_experiment_enabled = false) const {
     if (!(*fpb)) {
-      CreateFilePrefetchBuffer(readahead_params, fpb, readaheadsize_cb, usage);
+      CreateFilePrefetchBuffer(readahead_params, fpb, readaheadsize_cb, usage,
+                               compaction_io_experiment_enabled);
     }
   }
 
