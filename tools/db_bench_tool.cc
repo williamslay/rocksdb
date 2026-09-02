@@ -13,6 +13,7 @@
 #endif
 #ifndef OS_WIN
 #include <unistd.h>
+#include <sys/resource.h>
 #endif
 #include <fcntl.h>
 #include <sys/types.h>
@@ -43,6 +44,7 @@
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
+#include "file/compaction_io_experiment.h"
 #include "monitoring/histogram.h"
 #include "monitoring/statistics_impl.h"
 #include "options/cf_options.h"
@@ -381,6 +383,18 @@ static bool ValidateUint32Range(const char* flagname, uint64_t value) {
   if (value > std::numeric_limits<uint32_t>::max()) {
     fprintf(stderr, "Invalid value for --%s: %lu, overflow\n", flagname,
             (unsigned long)value);
+    return false;
+  }
+  return true;
+}
+
+static bool ValidateCompactionIODepth(const char* flagname, uint64_t value) {
+  if (value != 0 &&
+      !ROCKSDB_NAMESPACE::CompactionIOExperiment::IsSupportedDepth(value)) {
+    fprintf(stderr,
+            "Invalid value for --%s: %" PRIu64
+            ", must be one of 0, 1, 2, 4, 8, 16, 32, or 64\n",
+            flagname, value);
     return false;
   }
   return true;
@@ -819,6 +833,19 @@ DEFINE_int32(file_opening_threads,
 DEFINE_uint64(compaction_readahead_size,
               ROCKSDB_NAMESPACE::Options().compaction_readahead_size,
               "Compaction readahead size");
+
+DEFINE_uint64(experimental_compaction_io_depth, 0,
+              "Internal compaction I/O experiment depth; allowed values: "
+              "0, 1, 2, 4, 8, 16, 32, 64");
+
+DEFINE_string(experimental_compaction_input_path, "",
+              "Internal compaction input path override");
+
+DEFINE_string(experimental_compaction_output_path, "",
+              "Internal compaction output path override");
+
+DEFINE_int32(experimental_compaction_output_path_id, 0,
+             "Internal compaction output path ID");
 
 DEFINE_int32(log_readahead_size, 0, "WAL and manifest readahead size");
 
@@ -1976,6 +2003,10 @@ static const bool FLAGS_prefix_size_dummy __attribute__((__unused__)) =
 static const bool FLAGS_key_size_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_key_size, &ValidateKeySize);
 
+static const bool FLAGS_experimental_compaction_io_depth_dummy
+    __attribute__((__unused__)) = RegisterFlagValidator(
+        &FLAGS_experimental_compaction_io_depth, &ValidateCompactionIODepth);
+
 static const bool FLAGS_cache_numshardbits_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_cache_numshardbits,
                           &ValidateCacheNumshardbits);
@@ -2110,6 +2141,21 @@ static bool IsTolerableIOError(const Status& s) {
   return FLAGS_tolerate_io_errors_for_remote_dbs &&
          (!FLAGS_env_uri.empty() || !FLAGS_fs_uri.empty()) && s.IsIOError() &&
          !status_to_io_status(Status(s)).GetDataLoss();
+}
+
+static uint64_t GetProcessCpuMicros() {
+#ifndef OS_WIN
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) != 0) {
+    return 0;
+  }
+  return static_cast<uint64_t>(usage.ru_utime.tv_sec) * 1000000 +
+         static_cast<uint64_t>(usage.ru_utime.tv_usec) +
+         static_cast<uint64_t>(usage.ru_stime.tv_sec) * 1000000 +
+         static_cast<uint64_t>(usage.ru_stime.tv_usec);
+#else
+  return 0;
+#endif
 }
 
 }  // namespace
@@ -5735,6 +5781,85 @@ class Benchmark {
   void Open(Options* opts, ToolHooks& hooks) {
     if (!InitializeOptionsFromFile(opts)) {
       InitializeOptionsFromFlags(opts);
+    }
+    if (FLAGS_experimental_compaction_io_depth > 0) {
+      opts->max_background_compactions = FLAGS_max_background_compactions;
+      opts->max_subcompactions = static_cast<uint32_t>(FLAGS_subcompactions);
+      opts->allow_mmap_reads = FLAGS_mmap_read;
+      opts->allow_mmap_writes = FLAGS_mmap_write;
+      opts->use_direct_reads = FLAGS_use_direct_reads;
+      opts->use_direct_io_for_compaction_reads =
+          FLAGS_use_direct_io_for_compaction_reads;
+      opts->use_direct_io_for_flush_and_compaction =
+          FLAGS_use_direct_io_for_flush_and_compaction;
+      opts->report_bg_io_stats = FLAGS_report_bg_io_stats;
+      fprintf(stdout,
+              "Compaction I/O options: max_background_compactions=%d "
+              "max_subcompactions=%u use_direct_reads=%d "
+              "use_direct_io_for_compaction_reads=%d "
+              "use_direct_io_for_flush_and_compaction=%d mmap_read=%d "
+              "mmap_write=%d report_bg_io_stats=%d\n",
+              opts->max_background_compactions, opts->max_subcompactions,
+              opts->use_direct_reads,
+              opts->use_direct_io_for_compaction_reads,
+              opts->use_direct_io_for_flush_and_compaction,
+              opts->allow_mmap_reads, opts->allow_mmap_writes,
+              opts->report_bg_io_stats);
+    }
+
+    const bool input_path_set =
+        !FLAGS_experimental_compaction_input_path.empty();
+    const bool output_path_set =
+        !FLAGS_experimental_compaction_output_path.empty();
+    if (FLAGS_experimental_compaction_output_path_id < 0) {
+      fprintf(stderr, "Invalid compaction output path ID: %d\n",
+              FLAGS_experimental_compaction_output_path_id);
+      db_bench_exit(1);
+    }
+    if (input_path_set != output_path_set) {
+      fprintf(stderr,
+              "Both experimental compaction input and output paths are "
+              "required together\n");
+      db_bench_exit(1);
+    }
+    if (FLAGS_experimental_compaction_output_path_id != 0 &&
+        (!input_path_set || !output_path_set)) {
+      fprintf(stderr,
+              "Both experimental compaction input and output paths are "
+              "required for a nonzero output path ID\n");
+      db_bench_exit(1);
+    }
+    if (input_path_set && output_path_set) {
+      opts->cf_paths.clear();
+      opts->db_paths = {
+          {FLAGS_experimental_compaction_input_path, 0},
+          {FLAGS_experimental_compaction_output_path, 0}};
+    }
+
+    const bool path_routing_requested =
+        input_path_set || output_path_set ||
+        FLAGS_experimental_compaction_output_path_id != 0;
+    if (path_routing_requested) {
+      const std::vector<DbPath>& effective_paths =
+          opts->cf_paths.empty() ? opts->db_paths : opts->cf_paths;
+      const size_t effective_path_count =
+          effective_paths.empty() ? 1 : effective_paths.size();
+      if (static_cast<size_t>(FLAGS_experimental_compaction_output_path_id) >=
+          effective_path_count) {
+        fprintf(stderr, "Invalid compaction output path ID: %d\n",
+                FLAGS_experimental_compaction_output_path_id);
+        db_bench_exit(1);
+      }
+
+      fprintf(stdout, "Compaction path routing: output_path_id=%d",
+              FLAGS_experimental_compaction_output_path_id);
+      if (input_path_set) {
+        fprintf(stdout, " input_path=%s output_path=%s",
+                FLAGS_experimental_compaction_input_path.c_str(),
+                FLAGS_experimental_compaction_output_path.c_str());
+      }
+      fprintf(stdout, " effective_path_count=%" ROCKSDB_PRIszt "\n",
+              effective_path_count);
     }
 
     InitializeOptionsGeneral(opts, hooks);
@@ -9930,8 +10055,24 @@ class Benchmark {
     db_with_cfh.db->DefaultColumnFamily()->GetDescriptor(&cfDesc);
     options.output_file_size_limit = cfDesc.options.target_file_size_base;
 
-    Status status =
-        db_with_cfh.db->CompactFiles(options, files_to_compact, next_level);
+    CompactionIOExperiment* experiment = CompactionIOExperiment::Active();
+    const uint64_t compaction_start_nanos =
+        experiment != nullptr ? FLAGS_env->GetSystemClock()->NowNanos() : 0;
+    const uint64_t cpu_start_micros =
+        experiment != nullptr ? GetProcessCpuMicros() : 0;
+    Status status = db_with_cfh.db->CompactFiles(
+        options, files_to_compact, next_level,
+        FLAGS_experimental_compaction_output_path_id);
+    if (experiment != nullptr) {
+      const uint64_t compaction_end_nanos =
+          FLAGS_env->GetSystemClock()->NowNanos();
+      const uint64_t cpu_end_micros = GetProcessCpuMicros();
+      experiment->RecordCompactionInterval(
+          (compaction_end_nanos - compaction_start_nanos) / 1000,
+          cpu_end_micros >= cpu_start_micros
+              ? cpu_end_micros - cpu_start_micros
+              : 0);
+    }
     if (!status.ok()) {
       // This can fail for valid reasons including the operation was aborted
       // or a filename is invalid because background compaction removed it.
@@ -10239,6 +10380,7 @@ class ReadFaultInjectionFS : public FileSystemWrapper {
 
 int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
+  GFLAGS_NAMESPACE::FlagSaver flag_saver;
   ConfigOptions config_options;
   static bool initialized = false;
   hooks_ = &hooks;
@@ -10403,8 +10545,20 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     db_bench_exit(1);
   }
 
-  ROCKSDB_NAMESPACE::Benchmark benchmark;
-  benchmark.Run(hooks);
+  std::unique_ptr<ROCKSDB_NAMESPACE::CompactionIOExperiment>
+      compaction_io_experiment;
+  if (FLAGS_experimental_compaction_io_depth > 0) {
+    compaction_io_experiment.reset(new ROCKSDB_NAMESPACE::CompactionIOExperiment(
+        FLAGS_experimental_compaction_io_depth,
+        FLAGS_env->GetSystemClock().get()));
+  }
+  {
+    ROCKSDB_NAMESPACE::Benchmark benchmark;
+    benchmark.Run(hooks);
+  }
+  if (compaction_io_experiment != nullptr) {
+    fprintf(stdout, "%s\n", compaction_io_experiment->ToJson().c_str());
+  }
 
   if (FLAGS_print_malloc_stats) {
     std::string stats_string;
