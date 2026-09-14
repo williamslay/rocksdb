@@ -49,6 +49,7 @@ namespace ROCKSDB_NAMESPACE {
 
 class Arena;
 class CompactionState;
+class CompactionIOExperiment;
 class ErrorHandler;
 class MemTable;
 class SnapshotChecker;
@@ -516,6 +517,9 @@ class CompactionJob {
   // Options File Number used for Remote Compaction
   // Setting this requires DBMutex.
   uint64_t options_file_number_ = 0;
+
+  CompactionIOExperiment* compaction_io_experiment_ = nullptr;
+  uint64_t compaction_io_experiment_start_micros_ = 0;
 
   // Writer for persisting compaction progress during compaction
   log::Writer* compaction_progress_writer_ = nullptr;

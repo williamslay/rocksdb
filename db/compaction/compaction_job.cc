@@ -34,6 +34,7 @@
 #include "db/version_edit.h"
 #include "db/version_set.h"
 #include "file/file_util.h"
+#include "file/compaction_io_experiment.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
 #include "file/sst_file_manager_impl.h"
@@ -1120,6 +1121,15 @@ void CompactionJob::FinalizeCompactionRun(
                                                   internal_stats_);
   RecordCompactionIOStats();
 
+  if (compaction_io_experiment_ != nullptr) {
+    const uint64_t end_timestamp = db_options_.clock->NowMicros();
+    compaction_io_experiment_->CompleteCompactionJob(
+        end_timestamp, end_timestamp - compaction_io_experiment_start_micros_,
+        job_stats_->cpu_micros, job_stats_->total_input_bytes,
+        job_stats_->total_output_bytes);
+    compaction_io_experiment_ = nullptr;
+  }
+
   LogFlush(db_options_.info_log);
   TEST_SYNC_POINT("CompactionJob::Run():End");
   compact_->status = input_status;
@@ -1131,6 +1141,15 @@ Status CompactionJob::Run() {
   InitializeCompactionRun();
 
   const uint64_t start_micros = db_options_.clock->NowMicros();
+  if (!compact_->compaction->is_manual_compaction()) {
+    compaction_io_experiment_ = CompactionIOExperiment::Active();
+    if (compaction_io_experiment_ != nullptr) {
+      compaction_io_experiment_start_micros_ = start_micros;
+      compaction_io_experiment_->BeginCompactionJob(
+          job_id_, start_micros, compact_->compaction->start_level(),
+          compact_->compaction->output_level());
+    }
+  }
 
   RunSubcompactions();
 
