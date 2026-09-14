@@ -581,6 +581,27 @@ TEST_F(DBBenchTest, NormalInvocationDoesNotPrintCompactionPathRouting) {
             std::string::npos);
 }
 
+TEST_F(DBBenchTest, EmitsAutomaticCompactionJobRecords) {
+  const SubprocessResult result = RunDbBenchSubprocess(
+      {"./db_bench", "--benchmarks=fillrandom", "--use_existing_db=false",
+       "--compression_type=none", "--num=20000", "--value_size=1000",
+       "--write_buffer_size=4096", "--max_write_buffer_number=2",
+       "--level0_file_num_compaction_trigger=2",
+       "--target_file_size_base=4096", "--max_bytes_for_level_base=8192",
+       "--max_background_compactions=1", "--subcompactions=1",
+       "--experimental_compaction_io_depth=2",
+       "--db=" + NewFixturePath("automatic_compaction_records")},
+      test_path_);
+  ASSERT_EQ(0, result.exit_status);
+  EXPECT_NE(result.stdout_text.find("\"compaction_io_experiment\""),
+            std::string::npos);
+  EXPECT_NE(result.stdout_text.find("\"job_id\""), std::string::npos);
+  EXPECT_NE(result.stdout_text.find("\"input_level\""), std::string::npos);
+  EXPECT_NE(result.stdout_text.find("\"output_level\""), std::string::npos);
+  EXPECT_NE(result.stdout_text.find("\"output_sync_us\""),
+            std::string::npos);
+}
+
 TEST_F(DBBenchTest, Compact0RejectsOutOfRangeOutputPathId) {
   const std::string fixture_db = NewFixturePath("compact0_out_of_range");
   const std::string output_path = NewFixturePath("compact0_out_of_range_output");

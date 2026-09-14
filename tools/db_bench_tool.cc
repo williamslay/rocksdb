@@ -10558,6 +10558,7 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
   }
   if (compaction_io_experiment != nullptr) {
     fprintf(stdout, "%s\n", compaction_io_experiment->ToJson().c_str());
+    fputs(compaction_io_experiment->JobRecordsToJsonLines().c_str(), stdout);
   }
 
   if (FLAGS_print_malloc_stats) {
