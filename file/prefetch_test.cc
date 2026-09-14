@@ -4543,6 +4543,28 @@ TEST(CompactionIOExperimentTest, RecordsAbortedAsyncReadsWithoutUnderflow) {
             std::string::npos);
 }
 
+TEST(CompactionIOExperimentTest, RecordsPerJobCriticalPathMetrics) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  experiment.BeginCompactionJob(7, 100, 1, 2);
+  experiment.RecordConsumerPoll(10, 12, 14, 16, true);
+  experiment.RecordConsumerPoll(20, 10, 15, 30, true);
+  experiment.RecordCompactionOutputWrite(11);
+  experiment.RecordCompactionOutputWrite(3);
+  experiment.RecordOutputSync(17);
+  experiment.CompleteCompactionJob(300, 200, 50, 1000, 800);
+
+  const std::string records = experiment.JobRecordsToJsonLines();
+  EXPECT_EQ(records,
+            "{\"job_id\":7,\"start_timestamp\":100,"
+            "\"end_timestamp\":300,\"input_level\":1,"
+            "\"output_level\":2,\"compaction_wall_us\":200,"
+            "\"compaction_cpu_us\":50,\"logical_input_bytes\":1000,"
+            "\"logical_output_bytes\":800,\"read_blocked_us\":4,"
+            "\"read_block_count\":1,\"read_count\":0,"
+            "\"write_blocked_us\":14,\"write_block_count\":2,"
+            "\"output_sync_us\":17}\n");
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

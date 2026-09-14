@@ -109,6 +109,7 @@ void CompactionIOExperiment::RecordConsumerPoll(uint64_t issue_micros,
       exposed_io_micros_.Add(exposed_io_micros);
       exposed_io_total_micros_.fetch_add(exposed_io_micros,
                                          std::memory_order_relaxed);
+      read_block_count_.fetch_add(1, std::memory_order_relaxed);
     }
   }
   if (was_waiting) {
@@ -118,6 +119,87 @@ void CompactionIOExperiment::RecordConsumerPoll(uint64_t issue_micros,
 
 void CompactionIOExperiment::RecordConsumed(uint64_t consumed_bytes) {
   consumed_bytes_.fetch_add(consumed_bytes, std::memory_order_relaxed);
+}
+
+void CompactionIOExperiment::RecordCompactionOutputWrite(
+    uint64_t blocked_micros) {
+  write_blocked_micros_.fetch_add(blocked_micros, std::memory_order_relaxed);
+  write_block_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CompactionIOExperiment::RecordOutputSync(uint64_t sync_micros) {
+  output_sync_micros_.fetch_add(sync_micros, std::memory_order_relaxed);
+}
+
+void CompactionIOExperiment::BeginCompactionJob(uint64_t job_id,
+                                                uint64_t start_timestamp,
+                                                int input_level,
+                                                int output_level) {
+  assert(!active_job_);
+  active_job_ = true;
+  active_job_metadata_.job_id = job_id;
+  active_job_metadata_.start_timestamp = start_timestamp;
+  active_job_metadata_.input_level = input_level;
+  active_job_metadata_.output_level = output_level;
+  active_job_baseline_.read_count =
+      read_count_.load(std::memory_order_relaxed);
+  active_job_baseline_.read_blocked_micros =
+      exposed_io_total_micros_.load(std::memory_order_relaxed);
+  active_job_baseline_.read_block_count =
+      read_block_count_.load(std::memory_order_relaxed);
+  active_job_baseline_.write_blocked_micros =
+      write_blocked_micros_.load(std::memory_order_relaxed);
+  active_job_baseline_.write_block_count =
+      write_block_count_.load(std::memory_order_relaxed);
+  active_job_baseline_.output_sync_micros =
+      output_sync_micros_.load(std::memory_order_relaxed);
+}
+
+void CompactionIOExperiment::CompleteCompactionJob(
+    uint64_t end_timestamp, uint64_t compaction_wall_us,
+    uint64_t compaction_cpu_us, uint64_t logical_input_bytes,
+    uint64_t logical_output_bytes) {
+  if (!active_job_) {
+    return;
+  }
+  JobRecord record = active_job_metadata_;
+  record.end_timestamp = end_timestamp;
+  record.compaction_wall_us = compaction_wall_us;
+  record.compaction_cpu_us = compaction_cpu_us;
+  record.logical_input_bytes = logical_input_bytes;
+  record.logical_output_bytes = logical_output_bytes;
+  record.read_count =
+      read_count_.load(std::memory_order_relaxed) - active_job_baseline_.read_count;
+  record.read_blocked_us = exposed_io_total_micros_.load(
+                               std::memory_order_relaxed) -
+                           active_job_baseline_.read_blocked_micros;
+  record.read_block_count =
+      read_block_count_.load(std::memory_order_relaxed) -
+      active_job_baseline_.read_block_count;
+  record.write_blocked_us =
+      write_blocked_micros_.load(std::memory_order_relaxed) -
+      active_job_baseline_.write_blocked_micros;
+  record.write_block_count =
+      write_block_count_.load(std::memory_order_relaxed) -
+      active_job_baseline_.write_block_count;
+  record.output_sync_us =
+      output_sync_micros_.load(std::memory_order_relaxed) -
+      active_job_baseline_.output_sync_micros;
+  {
+    std::lock_guard<std::mutex> lock(job_records_mutex_);
+    job_records_.emplace_back(std::move(record));
+  }
+  active_job_ = false;
+}
+
+std::string CompactionIOExperiment::JobRecordsToJsonLines() const {
+  std::lock_guard<std::mutex> lock(job_records_mutex_);
+  std::string result;
+  for (const auto& record : job_records_) {
+    result.append(record.ToJson());
+    result.push_back('\n');
+  }
+  return result;
 }
 
 void CompactionIOExperiment::RecordCompactionInterval(
@@ -142,7 +224,12 @@ std::string HistogramToJson(const HistogramImpl& histogram) {
 }  // namespace
 
 std::string CompactionIOExperiment::ToJson() const {
-  char buffer[1600];
+  char buffer[2000];
+  size_t completed_job_count;
+  {
+    std::lock_guard<std::mutex> lock(job_records_mutex_);
+    completed_job_count = job_records_.size();
+  }
   snprintf(buffer, sizeof(buffer),
            "{\"compaction_io_experiment\":{\"depth\":%zu,"
            "\"request_span_bytes\":%zu,\"t_compaction_us\":%" PRIu64 ","
@@ -151,9 +238,14 @@ std::string CompactionIOExperiment::ToJson() const {
            ",\"ready_bytes\":%" PRIu64 ",\"consumed_bytes\":%" PRIu64
            ",\"demand_count\":%" PRIu64 ",\"demand_bytes\":%" PRIu64
            ",\"stall_count\":%" PRIu64 ",\"outstanding_async_reads\":%" PRIu64
-           ",\"overlap_total_us\":%" PRIu64
+            ",\"overlap_total_us\":%" PRIu64
             ",\"exposed_io_total_us\":%" PRIu64
-            ",\"io_service_us\":%s,\"sync_fallback_read_us\":%s,"
+            ",\"read_block_count\":%" PRIu64
+            ",\"write_blocked_us\":%" PRIu64
+            ",\"write_block_count\":%" PRIu64
+            ",\"output_sync_us\":%" PRIu64
+            ",\"completed_compaction_jobs\":%zu,"
+            "\"io_service_us\":%s,\"sync_fallback_read_us\":%s,"
             "\"overlap_us\":%s,"
             "\"exposed_io_us\":%s}}",
            depth_, kRequestSpan,
@@ -168,12 +260,39 @@ std::string CompactionIOExperiment::ToJson() const {
            demand_bytes_.load(std::memory_order_relaxed),
            stall_count_.load(std::memory_order_relaxed),
            outstanding_async_reads_.load(std::memory_order_relaxed),
-            overlap_total_micros_.load(std::memory_order_relaxed),
+           overlap_total_micros_.load(std::memory_order_relaxed),
             exposed_io_total_micros_.load(std::memory_order_relaxed),
-            HistogramToJson(io_service_micros_).c_str(),
+            read_block_count_.load(std::memory_order_relaxed),
+            write_blocked_micros_.load(std::memory_order_relaxed),
+            write_block_count_.load(std::memory_order_relaxed),
+            output_sync_micros_.load(std::memory_order_relaxed),
+            completed_job_count,
+           HistogramToJson(io_service_micros_).c_str(),
             HistogramToJson(sync_fallback_read_micros_).c_str(),
             HistogramToJson(overlap_micros_).c_str(),
            HistogramToJson(exposed_io_micros_).c_str());
+  return buffer;
+}
+
+std::string CompactionIOExperiment::JobRecord::ToJson() const {
+  char buffer[800];
+  snprintf(buffer, sizeof(buffer),
+           "{\"job_id\":%" PRIu64 ",\"start_timestamp\":%" PRIu64
+           ",\"end_timestamp\":%" PRIu64 ",\"input_level\":%d,"
+           "\"output_level\":%d,\"compaction_wall_us\":%" PRIu64
+           ",\"compaction_cpu_us\":%" PRIu64
+           ",\"logical_input_bytes\":%" PRIu64
+           ",\"logical_output_bytes\":%" PRIu64
+           ",\"read_blocked_us\":%" PRIu64
+           ",\"read_block_count\":%" PRIu64
+           ",\"read_count\":%" PRIu64
+           ",\"write_blocked_us\":%" PRIu64
+           ",\"write_block_count\":%" PRIu64
+           ",\"output_sync_us\":%" PRIu64 "}",
+           job_id, start_timestamp, end_timestamp, input_level, output_level,
+           compaction_wall_us, compaction_cpu_us, logical_input_bytes,
+           logical_output_bytes, read_blocked_us, read_block_count, read_count,
+           write_blocked_us, write_block_count, output_sync_us);
   return buffer;
 }
 
