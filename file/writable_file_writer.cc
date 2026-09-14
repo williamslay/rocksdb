@@ -13,6 +13,7 @@
 #include <mutex>
 
 #include "db/version_edit.h"
+#include "file/compaction_io_experiment.h"
 #include "file/file_util.h"
 #include "monitoring/histogram.h"
 #include "monitoring/iostats_context_imp.h"
@@ -588,6 +589,13 @@ IOStatus WritableFileWriter::WriteBuffered(const IOOptions& opts,
   DataVerificationInfo v_info;
   char checksum_buf[sizeof(uint32_t)];
   Env::IOPriority rate_limiter_priority_used = opts.rate_limiter_priority;
+  CompactionIOExperiment* experiment =
+      opts.io_activity == Env::IOActivity::kCompaction
+          ? CompactionIOExperiment::Active()
+          : nullptr;
+  if (experiment != nullptr && !experiment->IsCompactionJobActive()) {
+    experiment = nullptr;
+  }
 
   while (left > 0) {
     size_t allowed = left;
@@ -612,6 +620,8 @@ IOStatus WritableFileWriter::WriteBuffered(const IOOptions& opts,
         auto prev_perf_level = GetPerfLevel();
 
         IOSTATS_CPU_TIMER_GUARD(cpu_write_nanos, clock_);
+        const uint64_t start_micros =
+            experiment != nullptr ? experiment->NowMicros() : 0;
         if (perform_data_verification_) {
           Crc32cHandoffChecksumCalculation(src, allowed, checksum_buf);
           v_info.checksum = Slice(checksum_buf, sizeof(uint32_t));
@@ -619,6 +629,10 @@ IOStatus WritableFileWriter::WriteBuffered(const IOOptions& opts,
                                      nullptr);
         } else {
           s = writable_file_->Append(Slice(src, allowed), opts, nullptr);
+        }
+        if (experiment != nullptr) {
+          experiment->RecordCompactionOutputWrite(experiment->NowMicros() -
+                                                  start_micros);
         }
         if (!s.ok()) {
           // If writable_file_->Append() failed, then the data may or may not
@@ -694,6 +708,10 @@ IOStatus WritableFileWriter::WriteBufferedWithChecksum(const IOOptions& opts,
       data_size -= tmp_size;
     }
   }
+  CompactionIOExperiment* experiment =
+      opts.io_activity == Env::IOActivity::kCompaction
+          ? CompactionIOExperiment::Active()
+          : nullptr;
 
   {
     IOSTATS_TIMER_GUARD(write_nanos);
@@ -710,9 +728,15 @@ IOStatus WritableFileWriter::WriteBufferedWithChecksum(const IOOptions& opts,
 
       IOSTATS_CPU_TIMER_GUARD(cpu_write_nanos, clock_);
 
+      const uint64_t start_micros =
+          experiment != nullptr ? experiment->NowMicros() : 0;
       EncodeFixed32(checksum_buf, buffered_data_crc32c_checksum_);
       v_info.checksum = Slice(checksum_buf, sizeof(uint32_t));
       s = writable_file_->Append(Slice(src, left), opts, v_info, nullptr);
+      if (experiment != nullptr) {
+        experiment->RecordCompactionOutputWrite(experiment->NowMicros() -
+                                                start_micros);
+      }
       SetPerfLevel(prev_perf_level);
     }
     if (ShouldNotifyListeners()) {
@@ -812,6 +836,10 @@ IOStatus WritableFileWriter::WriteDirect(const IOOptions& opts) {
   DataVerificationInfo v_info;
   char checksum_buf[sizeof(uint32_t)];
   Env::IOPriority rate_limiter_priority_used = opts.rate_limiter_priority;
+  CompactionIOExperiment* experiment =
+      opts.io_activity == Env::IOActivity::kCompaction
+          ? CompactionIOExperiment::Active()
+          : nullptr;
 
   while (left > 0) {
     // Check how much is allowed
@@ -831,6 +859,8 @@ IOStatus WritableFileWriter::WriteDirect(const IOOptions& opts) {
         start_ts = FileOperationInfo::StartNow();
       }
       // direct writes must be positional
+      const uint64_t start_micros =
+          experiment != nullptr ? experiment->NowMicros() : 0;
       if (perform_data_verification_) {
         Crc32cHandoffChecksumCalculation(src, size, checksum_buf);
         v_info.checksum = Slice(checksum_buf, sizeof(uint32_t));
@@ -839,6 +869,10 @@ IOStatus WritableFileWriter::WriteDirect(const IOOptions& opts) {
       } else {
         s = writable_file_->PositionedAppend(Slice(src, size), write_offset,
                                              opts, nullptr);
+      }
+      if (experiment != nullptr) {
+        experiment->RecordCompactionOutputWrite(experiment->NowMicros() -
+                                                start_micros);
       }
 
       if (ShouldNotifyListeners()) {
@@ -915,6 +949,10 @@ IOStatus WritableFileWriter::WriteDirectWithChecksum(const IOOptions& opts) {
   size_t left = buf_.CurrentSize();
   DataVerificationInfo v_info;
   char checksum_buf[sizeof(uint32_t)];
+  CompactionIOExperiment* experiment =
+      opts.io_activity == Env::IOActivity::kCompaction
+          ? CompactionIOExperiment::Active()
+          : nullptr;
 
   Env::IOPriority rate_limiter_priority_used = opts.rate_limiter_priority;
   // Check how much is allowed. Here, we loop until the rate limiter allows to
@@ -940,10 +978,16 @@ IOStatus WritableFileWriter::WriteDirectWithChecksum(const IOOptions& opts) {
       start_ts = FileOperationInfo::StartNow();
     }
     // direct writes must be positional
+    const uint64_t start_micros =
+        experiment != nullptr ? experiment->NowMicros() : 0;
     EncodeFixed32(checksum_buf, buffered_data_crc32c_checksum_);
     v_info.checksum = Slice(checksum_buf, sizeof(uint32_t));
     s = writable_file_->PositionedAppend(Slice(src, left), write_offset, opts,
                                          v_info, nullptr);
+    if (experiment != nullptr) {
+      experiment->RecordCompactionOutputWrite(experiment->NowMicros() -
+                                              start_micros);
+    }
 
     if (ShouldNotifyListeners()) {
       auto finish_ts = std::chrono::steady_clock::now();

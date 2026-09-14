@@ -11,6 +11,7 @@
 #include "db/compaction/compaction_outputs.h"
 
 #include "db/builder.h"
+#include "file/compaction_io_experiment.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -72,8 +73,17 @@ IOStatus CompactionOutputs::WriterSyncClose(const Status& input_status,
   io_s = WritableFileWriter::PrepareIOOptions(
       WriteOptions(Env::IOActivity::kCompaction), opts);
   if (input_status.ok() && io_s.ok()) {
-    StopWatch sw(clock, statistics, COMPACTION_OUTFILE_SYNC_MICROS);
-    io_s = file_writer_->Sync(opts, use_fsync);
+    CompactionIOExperiment* experiment = CompactionIOExperiment::Active();
+    uint64_t sync_micros = 0;
+    {
+      StopWatch sw(clock, statistics, COMPACTION_OUTFILE_SYNC_MICROS,
+                   Histograms::HISTOGRAM_ENUM_MAX,
+                   experiment != nullptr ? &sync_micros : nullptr);
+      io_s = file_writer_->Sync(opts, use_fsync);
+    }
+    if (experiment != nullptr) {
+      experiment->RecordOutputSync(sync_micros);
+    }
   }
   if (input_status.ok() && io_s.ok()) {
     io_s = file_writer_->Close(opts);
