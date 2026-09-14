@@ -1,0 +1,60 @@
+{
+  "accepted_marker": "R3_V4_FORMAL_RESULT_ACCEPTED",
+  "accepted_nvme_root": "/mnt/rocksdb-nvme-b/rocksdb-compaction-io-isolation/r3-v4-custody-complete-g19-r2-overhead",
+  "accepted_report": "results/ycsb-critical-path/r3-v4-custody-complete-g19-r2/summary/r3-v4-report.md",
+  "archive_id": "compaction-io-experiment-20260914",
+  "code_snapshot_commit": "c943741645c9a9875be1dc0ccb4f3d802bb17147",
+  "created_at": "2026-09-14T14:57:41+08:00",
+  "excluded_other_user_data": "/mnt/rocksdb-nvme-b/test was not inspected, copied, modified, or hashed; it is owned by yhliang.",
+  "formal_receipts": {
+    "count": 9,
+    "ids": [
+      "r4c-w1-r1",
+      "r4c-w1-r2",
+      "r4c-w1-r3",
+      "r4c-a-r1",
+      "r4c-a-r2",
+      "r4c-a-r3",
+      "r4c-b-r1",
+      "r4c-b-r2",
+      "r4c-b-r3"
+    ],
+    "status": "PASS"
+  },
+  "historical_evidence_commit": "e1143c77f3b7da4ebf24d018e50757805910de90",
+  "historical_nvme_root": "/mnt/rocksdb-nvme-b/rocksdb-compaction-io-isolation/r3-p5-overhead",
+  "initial_code_commit": "486fda4494985fe72527d1ea97a0f8fe45a88659",
+  "inventories": {
+    "accepted_nvme_overhead": {
+      "file": "manifests/nvme-accepted-overhead.sha256",
+      "regular_file_count": 225
+    },
+    "curated_archive": "curated-evidence.tar.gz",
+    "historical_nvme_overhead": {
+      "file": "manifests/nvme-r3-p5-overhead.sha256",
+      "regular_file_count": 149
+    },
+    "local_results": {
+      "file": "manifests/local-results.sha256",
+      "regular_file_count": 356
+    }
+  },
+  "local_results_root": "/home/sylei/rocksdb/results/ycsb-critical-path/r3-v4-custody-complete-g19-r2",
+  "overhead_receipts": {
+    "count": 6,
+    "ids": [
+      "M0-r1",
+      "M0-r2",
+      "M0-r3",
+      "M1-r1",
+      "M1-r2",
+      "M1-r3"
+    ],
+    "status": "PASS"
+  },
+  "provenance_note": "Accepted R3-v4 evidence was generated from historical frozen-build commit e1143c77f3b7da4ebf24d018e50757805910de90 and its recorded custody state; this tag preserves current code snapshot c943741645c9a9875be1dc0ccb4f3d802bb17147 and must not be claimed as the evidence-generation commit.",
+  "raw_database_policy": "Raw RocksDB databases are excluded from Git archive. Original local/NVMe trees remain at recorded paths and are covered by SHA-256 inventories.",
+  "schema_version": 1,
+  "symlink_manifest": "manifests/symlinks.tsv",
+  "tag_name": "compaction-io-experiment-20260914"
+}

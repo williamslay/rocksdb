@@ -1,0 +1,3 @@
+link_path	target	role	target_inventoried
+results/ycsb-critical-path/r3-v4-custody-complete-g19-r2/overhead	/mnt/rocksdb-nvme-b/rocksdb-compaction-io-isolation/r3-v4-custody-complete-g19-r2-overhead	current accepted R3-v4 overhead	yes
+results/ycsb-critical-path/r3-v4/overhead	/mnt/rocksdb-nvme-b/rocksdb-compaction-io-isolation/r3-p5-overhead	historical R3-v4 overhead	yes
