@@ -15,6 +15,7 @@
 #include "db/compaction/compaction_iterator.h"
 #include "db/internal_stats.h"
 #include "db/output_validator.h"
+#include "file/compaction_io_experiment.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -68,6 +69,11 @@ class CompactionOutputs {
   // Assign a new WritableFileWriter to the current output
   void AssignFileWriter(WritableFileWriter* writer) {
     file_writer_.reset(writer);
+  }
+
+  void SetCompactionIOExperimentContext(
+      CompactionIOExperiment::JobContextPtr context) {
+    compaction_io_experiment_context_ = std::move(context);
   }
 
   // TODO: Move the BlobDB builder into CompactionOutputs
@@ -322,6 +328,7 @@ class CompactionOutputs {
   // current output builder and writer
   std::unique_ptr<TableBuilder> builder_;
   std::unique_ptr<WritableFileWriter> file_writer_;
+  CompactionIOExperiment::JobContextPtr compaction_io_experiment_context_;
   uint64_t current_output_file_size_ = 0;
   SequenceNumber smallest_preferred_seqno_ = kMaxSequenceNumber;
 

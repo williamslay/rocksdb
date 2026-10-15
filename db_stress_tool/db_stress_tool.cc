@@ -27,6 +27,7 @@
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_driver.h"
 #include "db_stress_tool/db_stress_shared_state.h"
+#include "file/compaction_io_experiment.h"
 #include "port/stack_trace.h"
 #include "rocksdb/convenience.h"
 #include "utilities/fault_injection_fs.h"
@@ -167,6 +168,13 @@ int db_stress_tool(int argc, char** argv) {
               FLAGS_delete_dir_and_exit.c_str(), s.ToString().c_str());
       return 1;
     }
+  }
+
+  s = AcquireCompactionIOExperimentFromEnvironment();
+  if (!s.ok()) {
+    fprintf(stderr, "Error configuring compaction I/O experiment: %s\n",
+            s.ToString().c_str());
+    return 1;
   }
 
   {
@@ -674,6 +682,12 @@ int db_stress_tool(int argc, char** argv) {
   }
   for (auto& fs : fault_fs_for_crash_flush) {
     fs = nullptr;
+  }
+  s = ReleaseCompactionIOExperiment();
+  if (!s.ok()) {
+    fprintf(stderr, "Error releasing compaction I/O experiment: %s\n",
+            s.ToString().c_str());
+    all_passed = false;
   }
   return all_passed ? 0 : 1;
 }

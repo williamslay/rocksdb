@@ -1255,7 +1255,11 @@ class PosixFileSystem : public FileSystem {
         // causing an infinite hang when we later wait for that handle.
         if (posix_handle->req_count == 2) {
           posix_handle->is_finished = true;
-          FSReadRequest req;
+          FSReadRequest req{};
+          req.offset = posix_handle->offset;
+          req.len = posix_handle->len;
+          req.scratch = posix_handle->scratch;
+          req.result = Slice(req.scratch, 0);
           req.status = IOStatus::Aborted();
           posix_handle->cb(req, posix_handle->cb_arg);
 

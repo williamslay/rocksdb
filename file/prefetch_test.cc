@@ -3,16 +3,25 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
+
 #include "db/db_test_util.h"
 #include "file/compaction_io_experiment.h"
 #include "file/file_prefetch_buffer.h"
 #include "file/file_util.h"
 #include "rocksdb/file_system.h"
+#include "test_util/mock_time_env.h"
 #include "test_util/sync_point.h"
 #ifdef GFLAGS
 #include "tools/io_tracer_parser_tool.h"
 #endif
 #include "rocksdb/flush_block_policy.h"
+#include "util/defer.h"
 #include "util/random.h"
 
 namespace {
@@ -228,6 +237,7 @@ TEST_P(PrefetchTest, Basic) {
   bool use_direct_io = std::get<1>(GetParam());
 
   std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, fs));
+  Defer close_db([this]() { Close(); });
   Options options;
   SetGenericOptions(env.get(), use_direct_io, options);
   options.statistics = CreateDBStatistics();
@@ -391,7 +401,6 @@ TEST_P(PrefetchTest, Basic) {
       buff_prefetch_count = 0;
     }
   }
-  Close();
 }
 
 class PrefetchTailTest : public PrefetchTest {
@@ -3296,9 +3305,20 @@ class FilePrefetchBufferTest : public testing::Test {
     std::string fpath = Path(fname);
     std::unique_ptr<FSRandomAccessFile> f;
     ASSERT_OK(fs_->NewRandomAccessFile(fpath, opts, &f, nullptr));
-    reader->reset(new RandomAccessFileReader(
-        std::move(f), fpath, env_->GetSystemClock().get(),
-        /*io_tracer=*/nullptr, stats_.get()));
+    reader->reset(new RandomAccessFileReader(std::move(f), fpath,
+                                             env_->GetSystemClock().get(),
+                                             nullptr, stats_.get()));
+  }
+
+  void ReadWithFileSystem(FileSystem* file_system, const std::string& fname,
+                          const FileOptions& opts,
+                          std::unique_ptr<RandomAccessFileReader>* reader) {
+    std::string fpath = Path(fname);
+    std::unique_ptr<FSRandomAccessFile> f;
+    ASSERT_OK(file_system->NewRandomAccessFile(fpath, opts, &f, nullptr));
+    reader->reset(new RandomAccessFileReader(std::move(f), fpath,
+                                             env_->GetSystemClock().get(),
+                                             nullptr, stats_.get()));
   }
 
   void AssertResult(const std::string& content,
@@ -3321,6 +3341,126 @@ class FilePrefetchBufferTest : public testing::Test {
 
   std::string Path(const std::string& fname) { return test_dir_ + "/" + fname; }
 };
+
+struct PCReadAsyncHandle {
+  std::function<void(FSReadRequest&, void*)> callback;
+  void* callback_arg;
+};
+
+class PCReadAsyncFileSystem;
+
+class PCReadAsyncRandomAccessFile : public FSRandomAccessFileOwnerWrapper {
+ public:
+  PCReadAsyncRandomAccessFile(PCReadAsyncFileSystem& file_system,
+                              std::unique_ptr<FSRandomAccessFile>& file)
+      : FSRandomAccessFileOwnerWrapper(std::move(file)),
+        file_system_(file_system) {}
+
+  IOStatus ReadAsync(FSReadRequest& request, const IOOptions& options,
+                     std::function<void(FSReadRequest&, void*)> callback,
+                     void* callback_arg, void** io_handle,
+                     IOHandleDeleter* deleter, IODebugContext* dbg) override;
+
+ private:
+  PCReadAsyncFileSystem& file_system_;
+};
+
+class PCReadAsyncFileSystem : public FileSystemWrapper {
+ public:
+  explicit PCReadAsyncFileSystem(const std::shared_ptr<FileSystem>& wrapped,
+                                 bool inline_completion = false)
+      : FileSystemWrapper(wrapped), inline_completion_(inline_completion) {}
+
+  const char* Name() const override { return "PCReadAsyncFileSystem"; }
+
+  IOStatus NewRandomAccessFile(const std::string& fname,
+                               const FileOptions& options,
+                               std::unique_ptr<FSRandomAccessFile>* result,
+                               IODebugContext* dbg) override {
+    std::unique_ptr<FSRandomAccessFile> file;
+    IOStatus status = target()->NewRandomAccessFile(fname, options, &file, dbg);
+    if (status.ok()) {
+      result->reset(new PCReadAsyncRandomAccessFile(*this, file));
+    }
+    return status;
+  }
+
+  IOStatus Poll(std::vector<void*>&, size_t) override {
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
+    workers.clear();
+    return IOStatus::OK();
+  }
+
+  IOStatus AbortIO(std::vector<void*>&) override {
+    {
+      std::lock_guard<std::mutex> lock(abort_mutex_);
+      abort_requested_ = true;
+    }
+    abort_condition_.notify_all();
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
+    workers.clear();
+    return IOStatus::OK();
+  }
+
+  void SupportedOps(int64_t& supported_ops) override {
+    supported_ops = 1 << FSSupportedOps::kAsyncIO;
+  }
+
+  size_t completion_count() const {
+    return completion_count_.load(std::memory_order_relaxed);
+  }
+
+  bool WaitForAbortForTest(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(abort_mutex_);
+    return abort_condition_.wait_for(lock, timeout,
+                                     [&] { return abort_requested_; });
+  }
+
+  bool inline_completion() const { return inline_completion_; }
+
+  void RecordCompletion() {
+    completion_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  std::vector<std::thread> workers;
+
+ private:
+  const bool inline_completion_;
+  std::atomic<size_t> completion_count_{0};
+  std::mutex abort_mutex_;
+  std::condition_variable abort_condition_;
+  bool abort_requested_ = false;
+};
+
+IOStatus PCReadAsyncRandomAccessFile::ReadAsync(
+    FSReadRequest& request, const IOOptions& options,
+    std::function<void(FSReadRequest&, void*)> callback, void* callback_arg,
+    void** io_handle, IOHandleDeleter* deleter, IODebugContext* dbg) {
+  *deleter = [](void* handle) {
+    delete static_cast<PCReadAsyncHandle*>(handle);
+  };
+  auto* handle = new PCReadAsyncHandle{std::move(callback), callback_arg};
+  *io_handle = handle;
+  auto complete_read = [this, request = std::move(request), options, dbg,
+                        handle]() mutable {
+    FSReadRequest completed = std::move(request);
+    completed.status =
+        target()->Read(completed.offset, completed.len, options,
+                       &completed.result, completed.scratch, dbg);
+    handle->callback(completed, handle->callback_arg);
+    file_system_.RecordCompletion();
+  };
+  if (file_system_.inline_completion()) {
+    complete_read();
+  } else {
+    file_system_.workers.emplace_back(std::move(complete_read));
+  }
+  return IOStatus::OK();
+}
 
 TEST_F(FilePrefetchBufferTest, SeekWithBlockCacheHit) {
   std::string fname = "seek-with-block-cache-hit";
@@ -3695,7 +3835,7 @@ TEST_F(FilePrefetchBufferTest, PollErrorPropagation) {
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
-TEST_F(FilePrefetchBufferTest, ReadAsyncSyncFallbackOnNotSupported) {
+TEST_F(FilePrefetchBufferTest, PC_READ_SYNC_FALLBACK) {
   std::string fname = "read-async-sync-fallback";
   Random rand(0);
   std::string content = rand.RandomString(32768);
@@ -3705,13 +3845,19 @@ TEST_F(FilePrefetchBufferTest, ReadAsyncSyncFallbackOnNotSupported) {
   std::unique_ptr<RandomAccessFileReader> r;
   Read(fname, opts, &r);
 
+  size_t injected_read_async_count = 0;
   SyncPoint::GetInstance()->SetCallBack(
-      "RandomAccessFileReader::ReadAsync:InjectStatus", [](void* arg) {
+      "RandomAccessFileReader::ReadAsync:InjectStatus", [&](void* arg) {
+        ++injected_read_async_count;
         *static_cast<IOStatus*>(arg) = IOStatus::NotSupported();
       });
   SyncPoint::GetInstance()->EnableProcessing();
 
-  CompactionIOExperiment experiment(2, SystemClock::Default().get());
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  auto experiment_context =
+      experiment.BeginCompactionJob(1, 0, 0, 1, 0, 1, "Unknown");
+  ASSERT_NE(experiment_context, nullptr);
   ReadaheadParams readahead_params;
   readahead_params.initial_readahead_size = 16384;
   readahead_params.max_readahead_size = 16384;
@@ -3720,7 +3866,8 @@ TEST_F(FilePrefetchBufferTest, ReadAsyncSyncFallbackOnNotSupported) {
   FilePrefetchBuffer fpb(readahead_params, /*enable=*/true,
                          /*track_min_offset=*/false, fs(), nullptr, nullptr,
                          nullptr, FilePrefetchBufferUsage::kUnknown,
-                         /*compaction_io_experiment_enabled=*/true);
+                         /*compaction_io_experiment_enabled=*/true,
+                         experiment_context);
 
   Slice result;
   Status s;
@@ -3728,14 +3875,329 @@ TEST_F(FilePrefetchBufferTest, ReadAsyncSyncFallbackOnNotSupported) {
   ASSERT_OK(s);
   ASSERT_EQ(result.size(), 4096);
   ASSERT_EQ(memcmp(result.data(), content.data(), 4096), 0);
-  EXPECT_NE(experiment.ToJson().find("\"read_count\":2"),
+  const std::string summary = experiment.ToJson();
+  EXPECT_NE(summary.find("\"read_count\":2"), std::string::npos);
+  EXPECT_NE(summary.find("\"io_service_us\":{\"count\":0"), std::string::npos);
+  EXPECT_NE(summary.find("\"sync_fallback_read_us\":{\"count\":2"),
             std::string::npos);
-  EXPECT_NE(experiment.ToJson().find("\"io_service_us\":{\"count\":0"),
-            std::string::npos);
-  EXPECT_NE(experiment.ToJson().find(
-                "\"sync_fallback_read_us\":{\"count\":2"),
-            std::string::npos);
+  const auto snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(injected_read_async_count, 1U);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total, 0U);
+  EXPECT_EQ(snapshot.input_uring_not_supported_count_total, 1U);
+  EXPECT_EQ(snapshot.input_sync_fallback_count_total, 1U);
+  std::cout << "PC_READ_SYNC_FALLBACK status=PASS read_count=2 "
+            << "async_io_service_count=0 sync_read_count=2 "
+            << "input_async_fallback_count=1" << std::endl;
 
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(FilePrefetchBufferTest, PC_READ_ASYNC_CONSUMER_WAIT) {
+  Random rand(0);
+  const std::string fname = "pc-read-async-consumer-wait";
+  const std::string content =
+      rand.RandomString(2 * CompactionIOExperiment::kRequestSpan);
+  Write(fname, content);
+
+  auto async_file_system =
+      std::make_shared<PCReadAsyncFileSystem>(FileSystem::Default());
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> reader;
+  ReadWithFileSystem(async_file_system.get(), fname, opts, &reader);
+
+  MockSystemClock clock(SystemClock::Default());
+  CompactionIOExperiment experiment(2, &clock);
+  auto experiment_context =
+      experiment.BeginCompactionJob(1, 0, 0, 1, 0, 1, "Unknown");
+  ASSERT_NE(experiment_context, nullptr);
+  ReadaheadParams readahead_params;
+  readahead_params.initial_readahead_size =
+      CompactionIOExperiment::kRequestSpan;
+  readahead_params.max_readahead_size = CompactionIOExperiment::kRequestSpan;
+  readahead_params.num_buffers = 2;
+
+  int poll_count = 0;
+  auto print_d2_trace =
+      [&](const char* state, const char* handoff,
+          const std::vector<std::tuple<uint64_t, size_t, bool>>& buffer_info) {
+        const auto& current = buffer_info[0];
+        const auto& alternate = buffer_info[1];
+        std::cout << "D2_TRACE_CSV,pc-read-async," << clock.NowMicros() << ",0,"
+                  << (!std::get<2>(current) ? 1 : 0) << ","
+                  << std::get<0>(current) << "," << std::get<1>(current) << ","
+                  << std::get<0>(alternate) << "," << std::get<1>(alternate)
+                  << "," << state << "," << handoff << "," << poll_count << ","
+                  << async_file_system->completion_count() << std::endl;
+      };
+  SyncPoint::GetInstance()->SetCallBack(
+      "FilePrefetchBuffer::PollIfNeeded:IOStatus", [&](void*) {
+        if (poll_count++ == 0) {
+          clock.SleepForMicroseconds(1000);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  {
+    FilePrefetchBuffer fpb(
+        readahead_params, true, false, async_file_system.get(), &clock, stats(),
+        nullptr, FilePrefetchBufferUsage::kUnknown, true, experiment_context);
+    Slice result;
+    Status status;
+    status = fpb.PrefetchAsync(IOOptions(), reader.get(), 0, 4096, &result);
+    ASSERT_TRUE(status.IsTryAgain());
+    std::vector<std::tuple<uint64_t, size_t, bool>> buffer_info(2);
+    fpb.TEST_GetBufferOffsetandSize(buffer_info);
+    print_d2_trace("async_issued", "producer_to_consumer", buffer_info);
+    status = Status::OK();
+    ASSERT_TRUE(fpb.TryReadFromCache(IOOptions(), reader.get(), 0, 4096,
+                                     &result, &status, false));
+    ASSERT_FALSE(status.IsNotSupported()) << "async I/O is unavailable";
+    ASSERT_OK(status);
+    ASSERT_EQ(result.ToString(), content.substr(0, 4096));
+    fpb.TEST_GetBufferOffsetandSize(buffer_info);
+    print_d2_trace("consumer_ready", "producer_to_consumer", buffer_info);
+  }
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  const auto snapshot = experiment.GetSnapshot();
+  std::cout << "PC_READ_ASYNC_CONSUMER_WAIT timestamp_us=" << clock.NowMicros()
+            << " poll_count=" << poll_count
+            << " read_block_count_delta=" << snapshot.read_block_count_total
+            << " read_blocked_us_delta=" << snapshot.read_blocked_us_total
+            << " outstanding_async_reads="
+            << experiment.outstanding_async_reads() << std::endl;
+  ASSERT_EQ(poll_count, 1);
+  ASSERT_EQ(snapshot.read_block_count_total, 1U);
+  ASSERT_GT(snapshot.read_blocked_us_total, 0U);
+  ASSERT_EQ(experiment.outstanding_async_reads(), 0U);
+}
+
+TEST_F(FilePrefetchBufferTest, CompactionAsyncReadHandlesInlineCompletion) {
+  const std::string fname = "compaction-async-inline-completion";
+  const std::string content =
+      Random(0).RandomString(2 * CompactionIOExperiment::kRequestSpan);
+  Write(fname, content);
+
+  auto async_file_system =
+      std::make_shared<PCReadAsyncFileSystem>(FileSystem::Default(), true);
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> reader;
+  ReadWithFileSystem(async_file_system.get(), fname, opts, &reader);
+
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  ReadaheadParams params;
+  params.initial_readahead_size = CompactionIOExperiment::kRequestSpan;
+  params.max_readahead_size = CompactionIOExperiment::kRequestSpan;
+  params.num_buffers = 2;
+
+  FilePrefetchBuffer prefetch(params, true, false, async_file_system.get(),
+                              SystemClock::Default().get(), stats(), nullptr,
+                              FilePrefetchBufferUsage::kUnknown, true, context);
+  Slice result;
+  Status status =
+      prefetch.PrefetchAsync(IOOptions(), reader.get(), 0, 4096, &result);
+  ASSERT_TRUE(status.IsTryAgain());
+  ASSERT_EQ(async_file_system->completion_count(), 2U);
+
+  const auto snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.input_uring_submit_count_total, 2U);
+  EXPECT_EQ(snapshot.input_uring_complete_count_total, 2U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 0U);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total,
+            snapshot.input_uring_complete_count_total +
+                snapshot.input_uring_zero_byte_completion_count_total +
+                snapshot.input_uring_abort_count_total +
+                snapshot.input_uring_error_count_total +
+                snapshot.input_uring_outstanding_count);
+
+  status = Status::OK();
+  ASSERT_TRUE(prefetch.TryReadFromCache(IOOptions(), reader.get(), 0, 4096,
+                                        &result, &status, false));
+  ASSERT_OK(status);
+  EXPECT_EQ(result.ToString(), content.substr(0, 4096));
+}
+
+TEST_F(FilePrefetchBufferTest, CompactionAsyncCallbackRacesConsumerPolling) {
+  const std::string fname = "compaction-async-callback-consumer-poll";
+  const std::string content =
+      Random(0).RandomString(2 * CompactionIOExperiment::kRequestSpan);
+  Write(fname, content);
+
+  auto async_file_system =
+      std::make_shared<PCReadAsyncFileSystem>(FileSystem::Default());
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> reader;
+  ReadWithFileSystem(async_file_system.get(), fname, opts, &reader);
+
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  ReadaheadParams params;
+  params.initial_readahead_size = CompactionIOExperiment::kRequestSpan;
+  params.max_readahead_size = CompactionIOExperiment::kRequestSpan;
+  params.num_buffers = 2;
+
+  std::mutex sync_mutex;
+  std::condition_variable sync_condition;
+  bool callback_paused = false;
+  bool poll_reached_ready_check = false;
+  bool release_callback = false;
+  bool release_poll = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FilePrefetchBuffer::PrefetchAsyncCallback:AfterTerminalClaim",
+      [&](void*) {
+        std::unique_lock<std::mutex> lock(sync_mutex);
+        callback_paused = true;
+        sync_condition.notify_all();
+        sync_condition.wait(lock, [&] { return release_callback; });
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "FilePrefetchBuffer::PollIfNeeded:BeforeReadyCheck", [&](void*) {
+        std::unique_lock<std::mutex> lock(sync_mutex);
+        poll_reached_ready_check = true;
+        sync_condition.notify_all();
+        sync_condition.wait(lock, [&] { return release_poll; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  FilePrefetchBuffer prefetch(params, true, false, async_file_system.get(),
+                              SystemClock::Default().get(), stats(), nullptr,
+                              FilePrefetchBufferUsage::kUnknown, true, context);
+  std::thread consumer;
+  Defer cleanup([&] {
+    {
+      std::lock_guard<std::mutex> lock(sync_mutex);
+      release_callback = true;
+      release_poll = true;
+    }
+    sync_condition.notify_all();
+    if (consumer.joinable()) {
+      consumer.join();
+    }
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  Slice result;
+  Status status =
+      prefetch.PrefetchAsync(IOOptions(), reader.get(), 0, 4096, &result);
+  ASSERT_TRUE(status.IsTryAgain());
+  {
+    std::unique_lock<std::mutex> lock(sync_mutex);
+    ASSERT_TRUE(sync_condition.wait_for(lock, std::chrono::seconds(5),
+                                        [&] { return callback_paused; }));
+  }
+
+  bool found = false;
+  Status poll_status;
+  consumer = std::thread([&] {
+    found = prefetch.TryReadFromCache(IOOptions(), reader.get(), 0, 4096,
+                                      &result, &poll_status, false);
+  });
+  bool consumer_reached_ready_check = false;
+  {
+    std::unique_lock<std::mutex> lock(sync_mutex);
+    consumer_reached_ready_check =
+        sync_condition.wait_for(lock, std::chrono::seconds(5),
+                                [&] { return poll_reached_ready_check; });
+    release_callback = true;
+    release_poll = true;
+  }
+  sync_condition.notify_all();
+  consumer.join();
+
+  ASSERT_TRUE(consumer_reached_ready_check);
+  ASSERT_TRUE(found);
+  ASSERT_OK(poll_status);
+  EXPECT_EQ(result.ToString(), content.substr(0, 4096));
+}
+
+TEST_F(FilePrefetchBufferTest,
+       CompactionCallbackClaimKeepsBufferAliveUntilCallbackCompletes) {
+  const std::string fname = "compaction-callback-claim-lifetime";
+  const std::string content =
+      Random(0).RandomString(2 * CompactionIOExperiment::kRequestSpan);
+  Write(fname, content);
+
+  auto async_file_system =
+      std::make_shared<PCReadAsyncFileSystem>(FileSystem::Default());
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> reader;
+  ReadWithFileSystem(async_file_system.get(), fname, opts, &reader);
+
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  ReadaheadParams params;
+  params.initial_readahead_size = CompactionIOExperiment::kRequestSpan;
+  params.max_readahead_size = CompactionIOExperiment::kRequestSpan;
+  params.num_buffers = 2;
+
+  std::mutex callback_mutex;
+  std::condition_variable callback_condition;
+  bool callback_paused = false;
+  bool release_callback = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FilePrefetchBuffer::PrefetchAsyncCallback:AfterTerminalClaim",
+      [&](void*) {
+        std::unique_lock<std::mutex> lock(callback_mutex);
+        callback_paused = true;
+        callback_condition.notify_all();
+        callback_condition.wait(lock, [&] { return release_callback; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto prefetch = std::make_unique<FilePrefetchBuffer>(
+      params, true, false, async_file_system.get(),
+      SystemClock::Default().get(), stats(), nullptr,
+      FilePrefetchBufferUsage::kUnknown, true, context);
+  Slice result;
+  Status status =
+      prefetch->PrefetchAsync(IOOptions(), reader.get(), 0, 4096, &result);
+  ASSERT_TRUE(status.IsTryAgain());
+  {
+    std::unique_lock<std::mutex> lock(callback_mutex);
+    if (!callback_condition.wait_for(lock, std::chrono::seconds(5),
+                                     [&] { return callback_paused; })) {
+      release_callback = true;
+      lock.unlock();
+      callback_condition.notify_all();
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      FAIL() << "async callback did not reach terminal claim";
+      return;
+    }
+  }
+
+  std::atomic<bool> destroyed{false};
+  std::thread destroyer([prefetch = std::move(prefetch), &destroyed]() mutable {
+    prefetch.reset();
+    destroyed.store(true, std::memory_order_release);
+  });
+  const bool abort_requested =
+      async_file_system->WaitForAbortForTest(std::chrono::seconds(5));
+  EXPECT_TRUE(abort_requested);
+  EXPECT_FALSE(destroyed.load(std::memory_order_acquire));
+  {
+    std::lock_guard<std::mutex> lock(callback_mutex);
+    release_callback = true;
+  }
+  callback_condition.notify_all();
+  destroyer.join();
+
+  EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+  EXPECT_EQ(async_file_system->completion_count(), 2U);
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
 }
@@ -3757,25 +4219,112 @@ TEST_F(FilePrefetchBufferTest, CompactionExperimentUsesFixedAsyncRequestSpan) {
       });
   SyncPoint::GetInstance()->EnableProcessing();
 
-  CompactionIOExperiment experiment(2, SystemClock::Default().get());
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  auto experiment_context =
+      experiment.BeginCompactionJob(1, 0, 0, 1, 0, 1, "Unknown");
+  ASSERT_NE(experiment_context, nullptr);
   ReadaheadParams readahead_params;
   readahead_params.initial_readahead_size =
       CompactionIOExperiment::kRequestSpan;
   readahead_params.max_readahead_size = CompactionIOExperiment::kRequestSpan;
   readahead_params.num_buffers = 2;
-  FilePrefetchBuffer fpb(
-      readahead_params, true, false, fs(), nullptr, nullptr, nullptr,
-      FilePrefetchBufferUsage::kUnknown, true);
+  FilePrefetchBuffer fpb(readahead_params, true, false, fs(), nullptr, nullptr,
+                         nullptr, FilePrefetchBufferUsage::kUnknown, true,
+                         experiment_context);
 
   Slice result;
   Status s;
   ASSERT_TRUE(
       fpb.TryReadFromCache(IOOptions(), r.get(), 0, 4096, &result, &s, true));
   ASSERT_OK(s);
+  ASSERT_TRUE(fpb.TryReadFromCache(IOOptions(), r.get(),
+                                   CompactionIOExperiment::kRequestSpan, 4096,
+                                   &result, &s, true));
+  ASSERT_OK(s);
+  ASSERT_TRUE(fpb.TryReadFromCache(IOOptions(), r.get(),
+                                   CompactionIOExperiment::kRequestSpan + 4096,
+                                   4096, &result, &s, true));
+  ASSERT_OK(s);
   ASSERT_FALSE(request_lengths.empty());
   for (size_t request_length : request_lengths) {
     EXPECT_EQ(request_length, CompactionIOExperiment::kRequestSpan);
   }
+  const auto snapshot = experiment.GetSnapshot();
+  EXPECT_TRUE(snapshot.witness_collected);
+  if (snapshot.input_uring_submit_count_total > 0) {
+    EXPECT_GT(snapshot.input_uring_complete_count_total, 0U);
+    EXPECT_GT(snapshot.input_uring_complete_bytes_total, 0U);
+  } else {
+    EXPECT_GT(snapshot.input_uring_not_supported_count_total, 0U);
+    EXPECT_GT(snapshot.input_sync_fallback_count_total, 0U);
+  }
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(FilePrefetchBufferTest, CompactionPrefetchStopsAtEOF) {
+  const size_t kRequestSpan = CompactionIOExperiment::kRequestSpan;
+  std::string content = Random(0).RandomString(kRequestSpan + 64 * 1024);
+  const std::string fname = "compaction-prefetch-stops-at-eof";
+  Write(fname, content);
+
+  FileOptions opts;
+  std::unique_ptr<RandomAccessFileReader> r;
+  Read(fname, opts, &r);
+
+  std::vector<std::pair<uint64_t, size_t>> requests;
+  size_t overlap_copy_count = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FilePrefetchBuffer::ReadAsync:Request", [&](void* arg) {
+        FSReadRequest* req = static_cast<FSReadRequest*>(arg);
+        requests.emplace_back(req->offset, req->len);
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "FilePrefetchBuffer::CopyDataToOverlapBuffer:Complete",
+      [&](void*) { ++overlap_copy_count; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "RandomAccessFileReader::ReadAsync:InjectStatus", [](void* arg) {
+        *static_cast<IOStatus*>(arg) = IOStatus::NotSupported();
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+  auto experiment_context =
+      experiment.BeginCompactionJob(1, 0, 0, 1, 0, 1, "Unknown");
+  ASSERT_NE(experiment_context, nullptr);
+  ReadaheadParams readahead_params;
+  readahead_params.initial_readahead_size = kRequestSpan;
+  readahead_params.max_readahead_size = kRequestSpan;
+  readahead_params.num_buffers = experiment.depth();
+  readahead_params.file_size = content.size();
+  FilePrefetchBuffer fpb(readahead_params, true, false, fs(), nullptr, nullptr,
+                         nullptr, FilePrefetchBufferUsage::kCompactionPrefetch,
+                         true, experiment_context);
+
+  Slice result;
+  Status s;
+  ASSERT_TRUE(
+      fpb.TryReadFromCache(IOOptions(), r.get(), 0, 4096, &result, &s, true));
+  ASSERT_OK(s);
+  ASSERT_EQ(result.size(), 4096);
+  ASSERT_EQ(result.ToString(), content.substr(0, 4096));
+
+  ASSERT_EQ(requests.size(), 1);
+  EXPECT_EQ(requests[0].first, kRequestSpan + 4096);
+  EXPECT_EQ(requests[0].second, kRequestSpan);
+  EXPECT_LT(requests[0].first, content.size());
+  EXPECT_GT(requests[0].first + requests[0].second, content.size());
+
+  const uint64_t overlap_offset = kRequestSpan + 4096 - 2048;
+  Slice overlap_result;
+  ASSERT_TRUE(fpb.TryReadFromCache(IOOptions(), r.get(), overlap_offset, 4096,
+                                   &overlap_result, &s, true));
+  ASSERT_OK(s);
+  ASSERT_EQ(overlap_copy_count, 2);
+  ASSERT_EQ(overlap_result.ToString(), content.substr(overlap_offset, 4096));
+  ASSERT_EQ(requests.size(), 1);
 
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
@@ -4355,6 +4904,154 @@ TEST(CompactionIOExperimentTest, AcceptsOnlyConfiguredDepths) {
   EXPECT_FALSE(CompactionIOExperiment::IsSupportedDepth(128));
 }
 
+TEST(CompactionIOExperimentTest, BorrowerBeforeJobRegistrationBlocksRelease) {
+  ASSERT_OK(AcquireCompactionIOExperiment(2, true));
+  auto borrower = CompactionIOExperiment::Active();
+  Defer cleanup([&] {
+    borrower.reset();
+    Status status = ReleaseCompactionIOExperiment();
+    status.PermitUncheckedError();
+  });
+
+  ASSERT_NE(borrower, nullptr);
+  EXPECT_TRUE(ReleaseCompactionIOExperiment().IsBusy());
+
+  const auto context =
+      borrower->BeginCompactionJob(1, 10, 11, 12, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  borrower->CompleteCompactionJob(1, 20, 21, 10, 5, 100, 90, true);
+  borrower.reset();
+  ASSERT_OK(ReleaseCompactionIOExperiment());
+  EXPECT_EQ(CompactionIOExperiment::Active(), nullptr);
+}
+
+TEST(CompactionIOExperimentTest, ReleaseBeforeBorrowLeavesNoActiveOwner) {
+  ASSERT_OK(AcquireCompactionIOExperiment(2, true));
+  Defer cleanup([] {
+    Status status = ReleaseCompactionIOExperiment();
+    status.PermitUncheckedError();
+  });
+
+  ASSERT_OK(ReleaseCompactionIOExperiment());
+  EXPECT_EQ(CompactionIOExperiment::Active(), nullptr);
+}
+
+TEST(CompactionIOExperimentTest, ActiveWorkBlocksReleaseWithoutBorrowers) {
+  ASSERT_OK(AcquireCompactionIOExperiment(2, true));
+  Defer cleanup([] {
+    Status status = ReleaseCompactionIOExperiment();
+    status.PermitUncheckedError();
+  });
+
+  auto owner = CompactionIOExperiment::Active();
+  ASSERT_NE(owner, nullptr);
+  const auto context =
+      owner->BeginCompactionJob(1, 10, 11, 12, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  owner.reset();
+  EXPECT_TRUE(ReleaseCompactionIOExperiment().IsBusy());
+
+  owner = CompactionIOExperiment::Active();
+  ASSERT_NE(owner, nullptr);
+  owner->CompleteCompactionJob(1, 20, 21, 10, 5, 100, 90, true);
+  owner->RecordAsynchronousReadIssued(64);
+  owner.reset();
+  EXPECT_TRUE(ReleaseCompactionIOExperiment().IsBusy());
+
+  owner = CompactionIOExperiment::Active();
+  ASSERT_NE(owner, nullptr);
+  owner->RecordAsynchronousReadCompleted(64, 1);
+  owner.reset();
+  ASSERT_OK(ReleaseCompactionIOExperiment());
+}
+
+TEST(CompactionIOExperimentTest, SamplerBorrowerBlocksReleaseUntilStopped) {
+  ASSERT_OK(AcquireCompactionIOExperiment(2, true));
+  auto sampler_experiment = CompactionIOExperiment::Active();
+  ASSERT_NE(sampler_experiment, nullptr);
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool sampler_ready = false;
+  bool stop_sampler = false;
+  std::thread sampler([experiment = std::move(sampler_experiment), &mutex,
+                       &condition, &sampler_ready, &stop_sampler] {
+    std::unique_lock<std::mutex> lock(mutex);
+    sampler_ready = true;
+    condition.notify_one();
+    condition.wait(lock, [&] { return stop_sampler; });
+    (void)experiment;
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    condition.wait(lock, [&] { return sampler_ready; });
+  }
+  EXPECT_TRUE(ReleaseCompactionIOExperiment().IsBusy());
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    stop_sampler = true;
+  }
+  condition.notify_one();
+  sampler.join();
+  EXPECT_OK(ReleaseCompactionIOExperiment());
+  EXPECT_EQ(CompactionIOExperiment::Active(), nullptr);
+}
+
+class CountingSystemClock : public SystemClock {
+ public:
+  const char* Name() const override { return "CountingSystemClock"; }
+
+  uint64_t NowMicros() override {
+    ++now_micros_calls;
+    return 100;
+  }
+
+  void SleepForMicroseconds(int) override {}
+
+  Status GetCurrentTime(int64_t* unix_time) override {
+    *unix_time = 100;
+    return Status::OK();
+  }
+
+  std::string TimeToString(uint64_t) override { return ""; }
+
+  uint64_t now_micros_calls = 0;
+};
+
+TEST(CompactionIOExperimentTest, HookOffSkipsTelemetryAccess) {
+  {
+    CountingSystemClock off_clock;
+    CompactionIOExperiment off(2, &off_clock, false);
+    EXPECT_EQ(CompactionIOExperiment::Active(), nullptr);
+    off.BeginCompactionJob(1, 10, 11, 12, 0, 1, "Unknown");
+    off.RecordSynchronousRead(100, 100, 10);
+    off.RecordCompactionOutputWrite(20);
+    off.RecordOutputSync(30);
+    off.CompleteCompactionJob(1, 20, 21, 10, 5, 100, 90, true);
+    EXPECT_EQ(off.NowMicros(), 0);
+    EXPECT_EQ(off_clock.now_micros_calls, 0);
+    EXPECT_EQ(off.outstanding_async_reads(), 0);
+    const auto snapshot = off.GetSnapshot();
+    EXPECT_EQ(snapshot.read_blocked_us_total, 0U);
+    EXPECT_EQ(snapshot.write_blocked_us_total, 0U);
+    EXPECT_EQ(snapshot.output_sync_us_total, 0U);
+    EXPECT_EQ(snapshot.compaction_worker_us_total, 0U);
+    EXPECT_NE(off.ToJson().find("\"read_count\":0"), std::string::npos);
+    EXPECT_EQ(off.JobRecordsToJsonLines(), "");
+  }
+
+  CountingSystemClock on_clock;
+  CompactionIOExperiment on(2, &on_clock, true);
+  on.BeginCompactionJob(1, 10, 11, 12, 0, 1, "Unknown");
+  const uint64_t now_micros = on.NowMicros();
+  on.RecordSynchronousRead(100, 100, 10);
+  on.RecordCompactionOutputWrite(20);
+  on.RecordOutputSync(30);
+  on.CompleteCompactionJob(1, now_micros, now_micros + 1, 10, 5, 100, 90, true);
+  EXPECT_GT(on_clock.now_micros_calls, 0);
+  EXPECT_NE(on.JobRecordsToJsonLines().find("\"job_id\":1"), std::string::npos);
+}
+
 TEST(CompactionIOExperimentTest, PreservesExistingTimingAndJsonFields) {
   CompactionIOExperiment experiment(4, SystemClock::Default().get());
   experiment.RecordConsumerPoll(10, 12, 14, 16, true);
@@ -4530,6 +5227,82 @@ TEST(CompactionIOExperimentTest, ReportsCompactionIntervalMeasurements) {
   EXPECT_NE(summary.find("\"cpu_time_us\":567"), std::string::npos);
 }
 
+TEST(CompactionIOExperimentTest, ExposesCumulativeWindowCounters) {
+  CompactionIOExperiment experiment(4, SystemClock::Default().get());
+
+  experiment.RecordConsumerPoll(10, 12, 14, 16, true);
+  experiment.RecordCompactionOutputWrite(11);
+  experiment.RecordOutputSync(17);
+  const auto first = experiment.GetSnapshot();
+
+  experiment.RecordConsumerPoll(20, 22, 24, 30, true);
+  experiment.RecordCompactionOutputWrite(3);
+  experiment.RecordOutputSync(5);
+  const auto second = experiment.GetSnapshot();
+
+  EXPECT_FALSE(first.witness_collected);
+  EXPECT_EQ(first.read_blocked_us_total, 4U);
+  EXPECT_EQ(first.read_block_count_total, 1U);
+  EXPECT_EQ(first.write_blocked_us_total, 11U);
+  EXPECT_EQ(first.write_block_count_total, 1U);
+  EXPECT_EQ(first.output_sync_us_total, 17U);
+  EXPECT_EQ(first.output_sync_count_total, 1U);
+  EXPECT_EQ(second.read_blocked_us_total - first.read_blocked_us_total, 8U);
+  EXPECT_EQ(second.read_block_count_total - first.read_block_count_total, 1U);
+  EXPECT_EQ(second.write_blocked_us_total - first.write_blocked_us_total, 3U);
+  EXPECT_EQ(second.write_block_count_total - first.write_block_count_total, 1U);
+  EXPECT_EQ(second.output_sync_us_total - first.output_sync_us_total, 5U);
+  EXPECT_EQ(second.output_sync_count_total - first.output_sync_count_total, 1U);
+}
+
+TEST(CompactionIOExperimentTest, MaintainsAggregateLogicalByteTotals) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get());
+
+  experiment.BeginCompactionJob(1, 10, 11, 12, 0, 1, "Unknown");
+  experiment.CompleteCompactionJob(1, 20, 21, 10, 5, 1000, 800, true);
+  const auto first = experiment.GetSnapshotAt(20);
+
+  experiment.BeginCompactionJob(2, 30, 31, 13, 0, 1, "Unknown");
+  experiment.CompleteCompactionJob(2, 40, 41, 10, 5, 300, 200, true);
+  const auto second = experiment.GetSnapshotAt(40);
+
+  EXPECT_EQ(first.logical_input_bytes_total, 1000U);
+  EXPECT_EQ(first.logical_output_bytes_total, 800U);
+  EXPECT_EQ(second.logical_input_bytes_total, 1300U);
+  EXPECT_EQ(second.logical_output_bytes_total, 1000U);
+  EXPECT_NE(experiment.ToJson().find("\"logical_input_bytes_total\":1300"),
+            std::string::npos);
+  EXPECT_NE(experiment.ToJson().find("\"logical_output_bytes_total\":1000"),
+            std::string::npos);
+}
+
+TEST(CompactionIOExperimentTest, IntegratesOverlappingCompactionWorkerTime) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get());
+
+  experiment.BeginCompactionJob(1, 0, 0, 1, 0, 1, "Unknown");
+  experiment.BeginCompactionJob(2, 5, 5, 2, 0, 1, "Unknown");
+  experiment.CompleteCompactionJob(1, 10, 10, 10, 0, 0, 0, true);
+  experiment.CompleteCompactionJob(2, 15, 15, 10, 0, 0, 0, true);
+
+  const auto snapshot = experiment.GetSnapshotAt(15);
+  EXPECT_EQ(snapshot.compaction_worker_us_total, 20U);
+  EXPECT_EQ(snapshot.active_compactions, 0U);
+  EXPECT_EQ(snapshot.compaction_lifecycle_count, 2U);
+}
+
+TEST(CompactionIOExperimentTest, ReportsRuntimeSubcompactionDrift) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get());
+
+  EXPECT_FALSE(experiment.RecordRuntimeMaxSubcompactions(2));
+  EXPECT_FALSE(experiment.RecordRuntimeMaxSubcompactions(1));
+
+  const std::string summary = experiment.ToJson();
+  EXPECT_NE(summary.find("\"runtime_max_subcompactions\":2"),
+            std::string::npos);
+  EXPECT_NE(summary.find("\"max_subcompactions_valid\":false"),
+            std::string::npos);
+}
+
 TEST(CompactionIOExperimentTest, RecordsAbortedAsyncReadsWithoutUnderflow) {
   CompactionIOExperiment experiment(4, SystemClock::Default().get());
   experiment.RecordAsynchronousReadIssued(1024);
@@ -4543,26 +5316,467 @@ TEST(CompactionIOExperimentTest, RecordsAbortedAsyncReadsWithoutUnderflow) {
             std::string::npos);
 }
 
-TEST(CompactionIOExperimentTest, RecordsPerJobCriticalPathMetrics) {
+TEST(CompactionIOExperimentTest,
+     ReconcilesInputAsyncReadsAcrossSnapshotBoundaries) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+
+  context->RecordWorkerThreadId(84);
+  context->RecordInputAsyncSubmitted(1024);
+  const auto t0 = experiment.GetSnapshot();
+  context->RecordInputAsyncSubmitted(2048);
+  context->RecordInputAsyncCompleted(1024, 768);
+  const auto t1 = experiment.GetSnapshot();
+
+  EXPECT_EQ(t0.input_uring_submit_count_total, 1U);
+  EXPECT_EQ(t0.input_uring_outstanding_count, 1U);
+  EXPECT_EQ(
+      t1.input_uring_submit_count_total - t0.input_uring_submit_count_total,
+      1U);
+  EXPECT_EQ(
+      t1.input_uring_complete_count_total - t0.input_uring_complete_count_total,
+      1U);
+  EXPECT_EQ(t1.input_uring_complete_bytes_total, 768U);
+  EXPECT_EQ(t1.input_uring_complete_request_bytes_total, 1024U);
+  EXPECT_EQ(t1.input_uring_outstanding_count, 1U);
+  EXPECT_EQ(t1.input_uring_outstanding_bytes, 2048U);
+  EXPECT_EQ(t1.worker_thread_id, 84U);
+  EXPECT_TRUE(t1.worker_ring_ready);
+}
+
+TEST(CompactionIOExperimentTest, WorkerRingReadinessResetsOnThreadChange) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto first_context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(first_context, nullptr);
+  first_context->RecordInputAsyncSubmitted(1024);
+
+  const auto first_snapshot = experiment.GetSnapshot();
+  ASSERT_EQ(first_snapshot.worker_thread_id, 42U);
+  ASSERT_TRUE(first_snapshot.worker_ring_ready);
+
+  const auto second_context =
+      experiment.BeginCompactionJob(2, 20, 21, 84, 0, 1, "Unknown");
+  ASSERT_NE(second_context, nullptr);
+
+  const auto second_snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(second_snapshot.worker_thread_id, 84U);
+  EXPECT_FALSE(second_snapshot.worker_ring_ready);
+
+  second_context->RecordWorkerThreadId(84);
+  EXPECT_FALSE(experiment.GetSnapshot().worker_ring_ready);
+
+  second_context->RecordInputAsyncSubmitted(2048);
+  const auto submitted_snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(submitted_snapshot.worker_thread_id, 84U);
+  EXPECT_TRUE(submitted_snapshot.worker_ring_ready);
+
+  ASSERT_NE(experiment.BeginCompactionJob(3, 30, 31, 84, 0, 1, "Unknown"),
+            nullptr);
+  EXPECT_TRUE(experiment.GetSnapshot().worker_ring_ready);
+}
+
+TEST(CompactionIOExperimentTest, WorkerRingReadinessTracksSubmittingContext) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto first_context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(first_context, nullptr);
+  first_context->RecordInputAsyncSubmitted(1024);
+
+  const auto first_snapshot = experiment.GetSnapshot();
+  ASSERT_EQ(first_snapshot.worker_thread_id, 42U);
+  ASSERT_TRUE(first_snapshot.worker_ring_ready);
+  EXPECT_EQ(first_snapshot.input_uring_submit_count_total, 1U);
+  EXPECT_EQ(first_snapshot.input_uring_submit_bytes_total, 1024U);
+  EXPECT_EQ(first_snapshot.input_uring_outstanding_count, 1U);
+  EXPECT_EQ(first_snapshot.input_uring_outstanding_bytes, 1024U);
+
+  const auto second_context =
+      experiment.BeginCompactionJob(2, 20, 21, 84, 0, 1, "Unknown");
+  ASSERT_NE(second_context, nullptr);
+
+  auto snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.worker_thread_id, 84U);
+  EXPECT_FALSE(snapshot.worker_ring_ready);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 1U);
+
+  first_context->RecordInputAsyncSubmitted(2048);
+  snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.worker_thread_id, 84U);
+  EXPECT_FALSE(snapshot.worker_ring_ready);
+  first_context->RecordInputAsyncCompleted(1024, 768);
+  snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.worker_thread_id, 84U);
+  EXPECT_FALSE(snapshot.worker_ring_ready);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total, 2U);
+  EXPECT_EQ(snapshot.input_uring_submit_bytes_total, 3072U);
+  EXPECT_EQ(snapshot.input_uring_complete_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_complete_bytes_total, 768U);
+  EXPECT_EQ(snapshot.input_uring_complete_request_bytes_total, 1024U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 1U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_bytes, 2048U);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total,
+            snapshot.input_uring_complete_count_total +
+                snapshot.input_uring_zero_byte_completion_count_total +
+                snapshot.input_uring_abort_count_total +
+                snapshot.input_uring_error_count_total +
+                snapshot.input_uring_outstanding_count);
+  EXPECT_EQ(snapshot.input_uring_submit_bytes_total,
+            snapshot.input_uring_complete_request_bytes_total +
+                snapshot.input_uring_zero_byte_request_bytes_total +
+                snapshot.input_uring_abort_bytes_total +
+                snapshot.input_uring_error_bytes_total +
+                snapshot.input_uring_outstanding_bytes);
+
+  second_context->RecordInputAsyncSubmitted(512);
+  snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.worker_thread_id, 84U);
+  EXPECT_TRUE(snapshot.worker_ring_ready);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total, 3U);
+  EXPECT_EQ(snapshot.input_uring_submit_bytes_total, 3584U);
+  EXPECT_EQ(snapshot.input_uring_complete_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 2U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_bytes, 2560U);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total,
+            snapshot.input_uring_complete_count_total +
+                snapshot.input_uring_zero_byte_completion_count_total +
+                snapshot.input_uring_abort_count_total +
+                snapshot.input_uring_error_count_total +
+                snapshot.input_uring_outstanding_count);
+  EXPECT_EQ(snapshot.input_uring_submit_bytes_total,
+            snapshot.input_uring_complete_request_bytes_total +
+                snapshot.input_uring_zero_byte_request_bytes_total +
+                snapshot.input_uring_abort_bytes_total +
+                snapshot.input_uring_error_bytes_total +
+                snapshot.input_uring_outstanding_bytes);
+}
+
+TEST(CompactionIOExperimentTest,
+     ConcurrentSnapshotsNeverExposePartialInputAsyncTransitions) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+
+  std::mutex start_mutex;
+  std::condition_variable start_condition;
+  bool writer_ready = false;
+  bool start_writer = false;
+  std::atomic<bool> writer_done{false};
+  std::thread writer([&] {
+    {
+      std::unique_lock<std::mutex> lock(start_mutex);
+      writer_ready = true;
+      start_condition.notify_one();
+      start_condition.wait(lock, [&] { return start_writer; });
+    }
+    for (uint64_t i = 0; i < 4096; ++i) {
+      const uint64_t requested_bytes = i % 1024 + 1;
+      context->RecordInputAsyncSubmitted(requested_bytes);
+      switch (i % 4) {
+        case 0:
+          context->RecordInputAsyncCompleted(requested_bytes, 1);
+          break;
+        case 1:
+          context->RecordInputAsyncCompleted(requested_bytes, 0);
+          break;
+        case 2:
+          context->RecordInputAsyncAborted(requested_bytes, true);
+          break;
+        case 3:
+          context->RecordInputAsyncAborted(requested_bytes, false);
+          break;
+      }
+    }
+    writer_done.store(true, std::memory_order_release);
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(start_mutex);
+    start_condition.wait(lock, [&] { return writer_ready; });
+    start_writer = true;
+  }
+  start_condition.notify_one();
+
+  auto verify_snapshot = [](const CompactionIOExperiment::Snapshot& snapshot) {
+    EXPECT_GE(snapshot.input_uring_submit_count_total,
+              snapshot.input_uring_complete_count_total +
+                  snapshot.input_uring_outstanding_count);
+    EXPECT_EQ(snapshot.input_uring_submit_count_total,
+              snapshot.input_uring_complete_count_total +
+                  snapshot.input_uring_zero_byte_completion_count_total +
+                  snapshot.input_uring_abort_count_total +
+                  snapshot.input_uring_error_count_total +
+                  snapshot.input_uring_outstanding_count);
+    EXPECT_EQ(snapshot.input_uring_submit_bytes_total,
+              snapshot.input_uring_complete_request_bytes_total +
+                  snapshot.input_uring_zero_byte_request_bytes_total +
+                  snapshot.input_uring_abort_bytes_total +
+                  snapshot.input_uring_error_bytes_total +
+                  snapshot.input_uring_outstanding_bytes);
+  };
+
+  uint64_t snapshot_count = 0;
+  do {
+    verify_snapshot(experiment.GetSnapshot());
+    ++snapshot_count;
+  } while (!writer_done.load(std::memory_order_acquire));
+  writer.join();
+  verify_snapshot(experiment.GetSnapshot());
+  EXPECT_GT(snapshot_count, 0U);
+}
+
+TEST(CompactionIOExperimentTest, CountsInputAsyncRejectFallbackAndFailure) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+
+  context->RecordAsynchronousReadRejected(1024);
+  context->RecordInputAsyncRejected(1024, true);
+  context->RecordInputSyncFallback(1024);
+  context->RecordInputAsyncSubmitted(512);
+  context->RecordInputAsyncAborted(512, true);
+  context->RecordInputAsyncSubmitted(256);
+  context->RecordInputAsyncAborted(256, false);
+  context->RecordInputAsyncSubmitted(128);
+  context->RecordInputAsyncCompleted(128, 0);
+  const auto snapshot = experiment.GetSnapshot();
+
+  EXPECT_EQ(snapshot.input_uring_rejected_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_rejected_bytes_total, 1024U);
+  EXPECT_EQ(snapshot.input_uring_not_supported_count_total, 1U);
+  EXPECT_EQ(snapshot.input_sync_fallback_count_total, 1U);
+  EXPECT_EQ(snapshot.input_sync_fallback_bytes_total, 1024U);
+  EXPECT_EQ(snapshot.input_uring_abort_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_abort_bytes_total, 512U);
+  EXPECT_EQ(snapshot.input_uring_error_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_error_bytes_total, 256U);
+  EXPECT_EQ(snapshot.input_uring_zero_byte_completion_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 0U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_bytes, 0U);
+}
+
+TEST(CompactionIOExperimentTest,
+     InlineCallbackBeforeReturnCommitsSubmissionAndTerminalTogether) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  const auto token = context->BeginInputAsyncRead(1024);
+  ASSERT_NE(token, nullptr);
+
+  context->RecordInputAsyncTerminal(token, 768, true, false);
+  const auto pending = experiment.GetSnapshot();
+  EXPECT_EQ(pending.input_uring_submit_count_total, 0U);
+  EXPECT_EQ(pending.input_uring_outstanding_count, 0U);
+  EXPECT_EQ(pending.input_uring_complete_count_total, 0U);
+
+  context->ResolveInputAsyncSubmission(token, true, false);
+  const auto resolved = experiment.GetSnapshot();
+  EXPECT_EQ(resolved.input_uring_submit_count_total, 1U);
+  EXPECT_EQ(resolved.input_uring_submit_bytes_total, 1024U);
+  EXPECT_EQ(resolved.input_uring_complete_count_total, 1U);
+  EXPECT_EQ(resolved.input_uring_complete_bytes_total, 768U);
+  EXPECT_EQ(resolved.input_uring_complete_request_bytes_total, 1024U);
+  EXPECT_EQ(resolved.input_uring_outstanding_count, 0U);
+  EXPECT_TRUE(resolved.worker_ring_ready);
+}
+
+TEST(CompactionIOExperimentTest,
+     ConcurrentCallbackBeforeReturnKeepsPendingSnapshotStable) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  const auto token = context->BeginInputAsyncRead(2048);
+  ASSERT_NE(token, nullptr);
+
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool callback_done = false;
+  std::thread callback([&] {
+    context->RecordInputAsyncTerminal(token, 1024, true, false);
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      callback_done = true;
+    }
+    condition.notify_one();
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    condition.wait(lock, [&] { return callback_done; });
+  }
+  callback.join();
+
+  for (int i = 0; i < 8; ++i) {
+    const auto pending = experiment.GetSnapshot();
+    EXPECT_EQ(pending.input_uring_submit_count_total, 0U);
+    EXPECT_EQ(pending.input_uring_submit_bytes_total, 0U);
+    EXPECT_EQ(pending.input_uring_complete_count_total, 0U);
+    EXPECT_EQ(pending.input_uring_outstanding_count, 0U);
+  }
+
+  context->ResolveInputAsyncSubmission(token, true, false);
+  const auto resolved = experiment.GetSnapshot();
+  EXPECT_EQ(resolved.input_uring_submit_count_total, 1U);
+  EXPECT_EQ(resolved.input_uring_complete_count_total, 1U);
+  EXPECT_EQ(resolved.input_uring_complete_request_bytes_total, 2048U);
+  EXPECT_EQ(resolved.input_uring_outstanding_count, 0U);
+}
+
+TEST(CompactionIOExperimentTest, CallbackAfterSubmissionCompletesOutstanding) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  const auto token = context->BeginInputAsyncRead(4096);
+  ASSERT_NE(token, nullptr);
+  context->ResolveInputAsyncSubmission(token, true, false);
+
+  auto snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.input_uring_submit_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 1U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_bytes, 4096U);
+  context->RecordInputAsyncTerminal(token, 3072, true, false);
+  context->RecordInputAsyncTerminal(token, 3072, true, false);
+  snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.input_uring_complete_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_complete_request_bytes_total, 4096U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 0U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_bytes, 0U);
+  EXPECT_TRUE(snapshot.worker_ring_ready);
+}
+
+TEST(CompactionIOExperimentTest, RejectedSubmissionsDoNotEnterAcceptedTotals) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  const auto not_supported = context->BeginInputAsyncRead(100);
+  const auto io_error = context->BeginInputAsyncRead(200);
+  ASSERT_NE(not_supported, nullptr);
+  ASSERT_NE(io_error, nullptr);
+
+  context->ResolveInputAsyncSubmission(not_supported, false, true);
+  context->ResolveInputAsyncSubmission(io_error, false, false);
+  context->RecordInputAsyncTerminal(not_supported, 100, true, false);
+  context->RecordInputAsyncTerminal(io_error, 0, false, false);
+  const auto snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.input_uring_rejected_count_total, 2U);
+  EXPECT_EQ(snapshot.input_uring_rejected_bytes_total, 300U);
+  EXPECT_EQ(snapshot.input_uring_not_supported_count_total, 1U);
+  EXPECT_EQ(snapshot.input_sync_fallback_count_total, 1U);
+  EXPECT_EQ(snapshot.input_sync_fallback_bytes_total, 100U);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total, 0U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 0U);
+}
+
+TEST(CompactionIOExperimentTest, AcceptedZeroErrorAndAbortTerminalsReconcile) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get(), true, {},
+                                    true);
+  const auto context =
+      experiment.BeginCompactionJob(1, 10, 11, 42, 0, 1, "Unknown");
+  ASSERT_NE(context, nullptr);
+  const auto zero = context->BeginInputAsyncRead(128);
+  const auto error = context->BeginInputAsyncRead(256);
+  const auto aborted = context->BeginInputAsyncRead(512);
+  ASSERT_NE(zero, nullptr);
+  ASSERT_NE(error, nullptr);
+  ASSERT_NE(aborted, nullptr);
+  context->ResolveInputAsyncSubmission(zero, true, false);
+  context->ResolveInputAsyncSubmission(error, true, false);
+  context->ResolveInputAsyncSubmission(aborted, true, false);
+
+  context->RecordInputAsyncTerminal(zero, 0, true, false);
+  context->RecordInputAsyncTerminal(error, 0, false, false);
+  context->RecordInputAsyncTerminal(aborted, 0, false, true);
+  context->RecordInputAsyncTerminal(aborted, 0, false, true);
+  const auto snapshot = experiment.GetSnapshot();
+  EXPECT_EQ(snapshot.input_uring_submit_count_total, 3U);
+  EXPECT_EQ(snapshot.input_uring_submit_bytes_total, 896U);
+  EXPECT_EQ(snapshot.input_uring_zero_byte_completion_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_zero_byte_request_bytes_total, 128U);
+  EXPECT_EQ(snapshot.input_uring_error_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_error_bytes_total, 256U);
+  EXPECT_EQ(snapshot.input_uring_abort_count_total, 1U);
+  EXPECT_EQ(snapshot.input_uring_abort_bytes_total, 512U);
+  EXPECT_EQ(snapshot.input_uring_outstanding_count, 0U);
+  EXPECT_EQ(snapshot.input_uring_submit_count_total,
+            snapshot.input_uring_complete_count_total +
+                snapshot.input_uring_zero_byte_completion_count_total +
+                snapshot.input_uring_abort_count_total +
+                snapshot.input_uring_error_count_total +
+                snapshot.input_uring_outstanding_count);
+  EXPECT_EQ(snapshot.input_uring_submit_bytes_total,
+            snapshot.input_uring_complete_request_bytes_total +
+                snapshot.input_uring_zero_byte_request_bytes_total +
+                snapshot.input_uring_abort_bytes_total +
+                snapshot.input_uring_error_bytes_total +
+                snapshot.input_uring_outstanding_bytes);
+}
+
+TEST(CompactionIOExperimentTest, EmitsExactSchemaWithPerJobCounters) {
   CompactionIOExperiment experiment(4, SystemClock::Default().get());
-  experiment.BeginCompactionJob(7, 100, 1, 2);
+  const auto context =
+      experiment.BeginCompactionJob(7, 100, 101, 42, 1, 2, "LevelMaxLevelSize");
+  CompactionIOExperiment::JobContextScope context_scope(context);
   experiment.RecordConsumerPoll(10, 12, 14, 16, true);
   experiment.RecordConsumerPoll(20, 10, 15, 30, true);
   experiment.RecordCompactionOutputWrite(11);
   experiment.RecordCompactionOutputWrite(3);
   experiment.RecordOutputSync(17);
-  experiment.CompleteCompactionJob(300, 200, 50, 1000, 800);
+  experiment.CompleteCompactionJob(7, 300, 301, 200, 50, 1000, 800, true);
 
   const std::string records = experiment.JobRecordsToJsonLines();
   EXPECT_EQ(records,
-            "{\"job_id\":7,\"start_timestamp\":100,"
-            "\"end_timestamp\":300,\"input_level\":1,"
-            "\"output_level\":2,\"compaction_wall_us\":200,"
-            "\"compaction_cpu_us\":50,\"logical_input_bytes\":1000,"
-            "\"logical_output_bytes\":800,\"read_blocked_us\":4,"
-            "\"read_block_count\":1,\"read_count\":0,"
+            "{\"thread_id\":42,\"job_id\":7,"
+            "\"start_monotonic_us\":100,\"start_epoch_us\":101,"
+            "\"end_monotonic_us\":300,\"end_epoch_us\":301,"
+            "\"compaction_wall_us\":200,\"logical_input_bytes\":1000,"
+            "\"compaction_reason\":\"LevelMaxLevelSize\","
+            "\"input_level\":1,\"output_level\":2,"
+            "\"compaction_cpu_us\":50,\"logical_output_bytes\":800,"
+            "\"read_blocked_us\":4,\"read_block_count\":1,"
             "\"write_blocked_us\":14,\"write_block_count\":2,"
-            "\"output_sync_us\":17}\n");
+            "\"output_sync_us\":17,"
+            "\"status\":\"OK\"}\n");
+}
+
+TEST(CompactionIOExperimentTest, AttributesOverlappingJobCallbacks) {
+  CompactionIOExperiment experiment(2, SystemClock::Default().get());
+  const auto first_context =
+      experiment.BeginCompactionJob(1, 0, 100, 11, 0, 1, "LevelL0FilesNum");
+  const auto second_context =
+      experiment.BeginCompactionJob(2, 5, 105, 12, 0, 1, "LevelMaxLevelSize");
+
+  first_context->RecordCompactionOutputWrite(7);
+  second_context->RecordCompactionOutputWrite(11);
+  experiment.CompleteCompactionJob(1, 10, 110, 10, 1, 100, 80, true);
+  first_context->RecordOutputSync(13);
+  experiment.CompleteCompactionJob(2, 15, 115, 10, 2, 200, 160, true);
+
+  const std::string records = experiment.JobRecordsToJsonLines();
+  EXPECT_NE(records.find("\"job_id\":1"), std::string::npos);
+  EXPECT_NE(records.find("\"job_id\":2"), std::string::npos);
+  EXPECT_NE(records.find("\"job_id\":1,\"start_monotonic_us\":0"),
+            std::string::npos);
+  EXPECT_NE(records.find("\"write_blocked_us\":7"), std::string::npos);
+  EXPECT_NE(records.find("\"write_blocked_us\":11"), std::string::npos);
+  EXPECT_NE(records.find("\"output_sync_us\":13"), std::string::npos);
+  EXPECT_EQ(experiment.GetSnapshotAt(15).compaction_worker_us_total, 20U);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

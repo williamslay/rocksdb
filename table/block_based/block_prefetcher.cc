@@ -28,6 +28,11 @@ void BlockPrefetcher::PrefetchIfNeeded(
   readahead_params.initial_readahead_size = readahead_size;
   readahead_params.max_readahead_size = readahead_size;
   readahead_params.num_buffers = is_async_io_prefetch ? 2 : 1;
+  if (is_for_compaction) {
+    TEST_SYNC_POINT_CALLBACK(
+        "BlockPrefetcher::PrefetchIfNeeded:CompactionReadaheadParams",
+        &readahead_params);
+  }
 
   const size_t len = BlockBasedTable::BlockSizeWithTrailer(handle);
   const size_t offset = handle.offset();
@@ -63,21 +68,18 @@ void BlockPrefetcher::PrefetchIfNeeded(
     // implicit_auto_readahead is set.
     readahead_params.initial_readahead_size = compaction_readahead_size_;
     readahead_params.max_readahead_size = compaction_readahead_size_;
-    bool compaction_io_experiment_enabled = false;
-    if (auto* experiment = CompactionIOExperiment::Active();
-        experiment != nullptr) {
-      readahead_params.initial_readahead_size =
-          CompactionIOExperiment::kRequestSpan;
-      readahead_params.max_readahead_size =
-          CompactionIOExperiment::kRequestSpan;
-      readahead_params.num_buffers = experiment->depth();
-      compaction_io_experiment_enabled = true;
+    auto compaction_io_experiment_context =
+        CompactionIOExperiment::CurrentJobContext();
+    if (compaction_io_experiment_context != nullptr) {
+      compaction_io_experiment_context->RecordEffectivePrefetchDepth(
+          readahead_params.num_buffers);
     }
+    readahead_params.file_size = rep->file_size;
     rep->CreateFilePrefetchBufferIfNotExists(
         readahead_params, &prefetch_buffer_,
         /*readaheadsize_cb=*/nullptr,
         /*usage=*/FilePrefetchBufferUsage::kCompactionPrefetch,
-        compaction_io_experiment_enabled);
+        std::move(compaction_io_experiment_context));
     return;
   }
 

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
@@ -908,12 +909,14 @@ struct BlockBasedTable::Rep {
       std::unique_ptr<FilePrefetchBuffer>* fpb,
       const std::function<void(bool, uint64_t&, uint64_t&)>& readaheadsize_cb,
       FilePrefetchBufferUsage usage,
-      bool compaction_io_experiment_enabled = false) const {
+      CompactionIOExperiment::JobContextPtr compaction_io_experiment_context =
+          nullptr) const {
     fpb->reset(new FilePrefetchBuffer(
         readahead_params, !ioptions.allow_mmap_reads /* enable */,
         false /* track_min_offset */, ioptions.fs.get(), ioptions.clock,
         ioptions.stats, readaheadsize_cb, usage,
-        compaction_io_experiment_enabled));
+        compaction_io_experiment_context != nullptr,
+        std::move(compaction_io_experiment_context)));
   }
 
   void CreateFilePrefetchBufferIfNotExists(
@@ -921,10 +924,11 @@ struct BlockBasedTable::Rep {
       std::unique_ptr<FilePrefetchBuffer>* fpb,
       const std::function<void(bool, uint64_t&, uint64_t&)>& readaheadsize_cb,
       FilePrefetchBufferUsage usage = FilePrefetchBufferUsage::kUnknown,
-      bool compaction_io_experiment_enabled = false) const {
+      CompactionIOExperiment::JobContextPtr compaction_io_experiment_context =
+          nullptr) const {
     if (!(*fpb)) {
       CreateFilePrefetchBuffer(readahead_params, fpb, readaheadsize_cb, usage,
-                               compaction_io_experiment_enabled);
+                               std::move(compaction_io_experiment_context));
     }
   }
 

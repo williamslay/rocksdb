@@ -73,20 +73,20 @@ IOStatus CompactionOutputs::WriterSyncClose(const Status& input_status,
   io_s = WritableFileWriter::PrepareIOOptions(
       WriteOptions(Env::IOActivity::kCompaction), opts);
   if (input_status.ok() && io_s.ok()) {
-    CompactionIOExperiment* experiment = CompactionIOExperiment::Active();
+    auto experiment = compaction_io_experiment_context_;
     uint64_t sync_micros = 0;
+    uint64_t finalization_micros = 0;
     {
       StopWatch sw(clock, statistics, COMPACTION_OUTFILE_SYNC_MICROS,
-                   Histograms::HISTOGRAM_ENUM_MAX,
-                   experiment != nullptr ? &sync_micros : nullptr);
-      io_s = file_writer_->Sync(opts, use_fsync);
+                   Histograms::HISTOGRAM_ENUM_MAX);
+      io_s = file_writer_->Sync(opts, use_fsync, &sync_micros);
+    }
+    if (io_s.ok()) {
+      io_s = file_writer_->Close(opts, &finalization_micros);
     }
     if (experiment != nullptr) {
-      experiment->RecordOutputSync(sync_micros);
+      experiment->RecordOutputSync(sync_micros + finalization_micros);
     }
-  }
-  if (input_status.ok() && io_s.ok()) {
-    io_s = file_writer_->Close(opts);
   }
 
   if (input_status.ok() && io_s.ok()) {

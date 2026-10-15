@@ -1122,12 +1122,17 @@ void CompactionJob::FinalizeCompactionRun(
   RecordCompactionIOStats();
 
   if (compaction_io_experiment_ != nullptr) {
-    const uint64_t end_timestamp = db_options_.clock->NowMicros();
+    const uint64_t end_monotonic_us =
+        compaction_io_experiment_context_->NowNanos() / 1000;
+    const uint64_t end_epoch_us =
+        compaction_io_experiment_context_->NowMicros();
     compaction_io_experiment_->CompleteCompactionJob(
-        end_timestamp, end_timestamp - compaction_io_experiment_start_micros_,
+        job_id_, end_monotonic_us, end_epoch_us,
+        end_monotonic_us - compaction_io_experiment_start_monotonic_us_,
         job_stats_->cpu_micros, job_stats_->total_input_bytes,
-        job_stats_->total_output_bytes);
-    compaction_io_experiment_ = nullptr;
+        job_stats_->total_output_bytes, input_status.ok());
+    compaction_io_experiment_context_.reset();
+    compaction_io_experiment_.reset();
   }
 
   LogFlush(db_options_.info_log);
@@ -1144,10 +1149,23 @@ Status CompactionJob::Run() {
   if (!compact_->compaction->is_manual_compaction()) {
     compaction_io_experiment_ = CompactionIOExperiment::Active();
     if (compaction_io_experiment_ != nullptr) {
-      compaction_io_experiment_start_micros_ = start_micros;
-      compaction_io_experiment_->BeginCompactionJob(
-          job_id_, start_micros, compact_->compaction->start_level(),
-          compact_->compaction->output_level());
+      compaction_io_experiment_->RecordRuntimeMaxSubcompactions(
+          compact_->compaction->max_subcompactions());
+      const uint64_t start_monotonic_us =
+          compaction_io_experiment_->NowNanos() / 1000;
+      const uint64_t start_epoch_us = compaction_io_experiment_->NowMicros();
+      compaction_io_experiment_start_monotonic_us_ = start_monotonic_us;
+      compaction_io_experiment_context_ =
+          compaction_io_experiment_->BeginCompactionJob(
+              job_id_, start_monotonic_us, start_epoch_us,
+              db_options_.env->GetThreadID(),
+              compact_->compaction->start_level(),
+              compact_->compaction->output_level(),
+              GetCompactionReasonString(
+                  compact_->compaction->compaction_reason()));
+      if (compaction_io_experiment_context_ == nullptr) {
+        compaction_io_experiment_ = nullptr;
+      }
     }
   }
 
@@ -1551,6 +1569,12 @@ InternalIterator* CompactionJob::CreateInputIterator(
     SubcompactionKeyBoundaries& boundaries, ReadOptions& read_options) {
   const size_t ts_sz = cfd->user_comparator()->timestamp_size();
   InitializeReadOptionsAndBoundaries(ts_sz, read_options, boundaries);
+  if (compaction_io_experiment_ != nullptr &&
+      !sub_compact->compaction->is_manual_compaction()) {
+    read_options.async_io = true;
+  }
+  TEST_SYNC_POINT_CALLBACK("CompactionJob::CreateInputIterator:ReadOptions",
+                           &read_options);
 
   // This is assigned after creation of SubcompactionState to simplify that
   // creation across both CompactionJob and CompactionServiceCompactionJob
@@ -1924,6 +1948,12 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   TEST_SYNC_POINT("CompactionJob::ProcessKeyValueCompaction:Start");
   assert(sub_compact);
   assert(sub_compact->compaction);
+  CompactionIOExperiment::JobContextScope context_scope(
+      compaction_io_experiment_context_);
+  if (compaction_io_experiment_context_ != nullptr) {
+    compaction_io_experiment_context_->RecordWorkerThreadId(
+        db_options_.env->GetThreadID());
+  }
 
   if (!ShouldUseLocalCompaction(sub_compact)) {
     return;
@@ -2479,6 +2509,7 @@ void CompactionJob::RecordCompactionIOStats() {
 Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
                                                CompactionOutputs& outputs) {
   assert(sub_compact != nullptr);
+  outputs.SetCompactionIOExperimentContext(compaction_io_experiment_context_);
 
   // no need to lock because VersionSet::next_file_number_ is atomic
   uint64_t file_number = versions_->NewFileNumber();
@@ -2617,7 +2648,8 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       std::move(writable_file), fname, fo_copy, db_options_.clock, io_tracer_,
       db_options_.stats, Histograms::SST_WRITE_MICROS, listeners,
       db_options_.file_checksum_gen_factory.get(),
-      tmp_set.Contains(FileType::kTableFile), false));
+      tmp_set.Contains(FileType::kTableFile), false, 0,
+      compaction_io_experiment_context_));
 
   // TODO(hx235): pass in the correct `oldest_key_time` instead of `0`
   const ReadOptions read_options(Env::IOActivity::kCompaction);

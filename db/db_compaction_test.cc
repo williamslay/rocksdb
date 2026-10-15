@@ -29,6 +29,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testutil.h"
 #include "util/concurrent_task_limiter_impl.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/fault_injection_env.h"
 #include "utilities/fault_injection_fs.h"
@@ -6668,6 +6669,8 @@ TEST_F(DBCompactionTest, UseDirectIoForCompactionReadsOffStaysBuffered) {
   options.use_direct_io_for_flush_and_compaction = false;
 
   std::atomic<bool> observed_direct_compaction_read{false};
+  std::atomic<bool> observed_async_compaction_read{true};
+  std::atomic<bool> observed_one_compaction_prefetch_buffer{false};
   std::atomic<int> observed_callbacks{0};
   std::atomic<int> observed_odirect_opens{0};
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
@@ -6678,6 +6681,19 @@ TEST_F(DBCompactionTest, UseDirectIoForCompactionReadsOffStaysBuffered) {
           observed_direct_compaction_read.store(true,
                                                 std::memory_order_relaxed);
         }
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::CreateInputIterator:ReadOptions", [&](void* arg) {
+        const auto* read_options = static_cast<const ReadOptions*>(arg);
+        observed_async_compaction_read.store(read_options->async_io,
+                                             std::memory_order_relaxed);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "BlockPrefetcher::PrefetchIfNeeded:CompactionReadaheadParams",
+      [&](void* arg) {
+        const auto* params = static_cast<const ReadaheadParams*>(arg);
+        observed_one_compaction_prefetch_buffer.store(
+            params->num_buffers == 1, std::memory_order_relaxed);
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "NewRandomAccessFile:O_DIRECT", [&](void* /*arg*/) {
@@ -6702,7 +6718,69 @@ TEST_F(DBCompactionTest, UseDirectIoForCompactionReadsOffStaysBuffered) {
 
   ASSERT_GT(observed_callbacks.load(), 0);
   ASSERT_FALSE(observed_direct_compaction_read.load());
+  ASSERT_FALSE(observed_async_compaction_read.load());
+  ASSERT_TRUE(observed_one_compaction_prefetch_buffer.load());
   ASSERT_EQ(0, observed_odirect_opens.load());
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  Destroy(options);
+}
+
+TEST_F(DBCompactionTest, AutomaticCompactionReadsUseAsyncPrefetch) {
+  Options options = CurrentOptions();
+  Destroy(options);
+  options.create_if_missing = true;
+  options.disable_auto_compactions = false;
+  options.compaction_style = kCompactionStyleLevel;
+  options.num_levels = 3;
+  options.level0_file_num_compaction_trigger = 3;
+  options.max_background_compactions = 1;
+  options.max_background_jobs = 1;
+  options.use_direct_reads = false;
+  options.use_direct_io_for_compaction_reads = false;
+  options.use_direct_io_for_flush_and_compaction = false;
+
+  ASSERT_OK(AcquireCompactionIOExperiment(2, true));
+  Defer release_experiment([] {
+    Status status = ReleaseCompactionIOExperiment();
+    status.PermitUncheckedError();
+  });
+  std::atomic<bool> observed_async_compaction_read{false};
+  std::atomic<bool> observed_two_compaction_prefetch_buffers{false};
+  std::atomic<int> observed_compaction_read_options{0};
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::CreateInputIterator:ReadOptions", [&](void* arg) {
+        const auto* read_options = static_cast<const ReadOptions*>(arg);
+        observed_compaction_read_options.fetch_add(1,
+                                                   std::memory_order_relaxed);
+        observed_async_compaction_read.store(read_options->async_io,
+                                             std::memory_order_relaxed);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "BlockPrefetcher::PrefetchIfNeeded:CompactionReadaheadParams",
+      [&](void* arg) {
+        const auto* params = static_cast<const ReadaheadParams*>(arg);
+        observed_two_compaction_prefetch_buffers.store(
+            params->num_buffers == 2, std::memory_order_relaxed);
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(TryReopen(options));
+
+  const std::string value(4096, 'v');
+  for (int file = 0; file < options.level0_file_num_compaction_trigger;
+       ++file) {
+    for (int key = 0; key < 64; ++key) {
+      ASSERT_OK(Put(Key(key), value));
+    }
+    ASSERT_OK(Flush());
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  ASSERT_GT(observed_compaction_read_options.load(), 0);
+  ASSERT_TRUE(observed_async_compaction_read.load());
+  ASSERT_TRUE(observed_two_compaction_prefetch_buffers.load());
 
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();

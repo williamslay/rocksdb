@@ -518,8 +518,10 @@ class CompactionJob {
   // Setting this requires DBMutex.
   uint64_t options_file_number_ = 0;
 
-  CompactionIOExperiment* compaction_io_experiment_ = nullptr;
-  uint64_t compaction_io_experiment_start_micros_ = 0;
+  std::shared_ptr<CompactionIOExperiment> compaction_io_experiment_;
+  std::shared_ptr<CompactionIOExperiment::JobContext>
+      compaction_io_experiment_context_;
+  uint64_t compaction_io_experiment_start_monotonic_us_ = 0;
 
   // Writer for persisting compaction progress during compaction
   log::Writer* compaction_progress_writer_ = nullptr;

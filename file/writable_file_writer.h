@@ -13,6 +13,7 @@
 
 #include "db/version_edit.h"
 #include "env/file_system_tracer.h"
+#include "file/compaction_io_experiment.h"
 #include "monitoring/thread_status_util.h"
 #include "port/port.h"
 #include "rocksdb/file_checksum.h"
@@ -166,6 +167,7 @@ class WritableFileWriter {
   bool perform_data_verification_;
   uint32_t buffered_data_crc32c_checksum_;
   bool buffered_data_with_checksum_;
+  CompactionIOExperiment::JobContextPtr compaction_io_experiment_context_;
   Temperature temperature_;
 
  public:
@@ -181,7 +183,9 @@ class WritableFileWriter {
       const std::vector<std::shared_ptr<EventListener>>& listeners = {},
       FileChecksumGenFactory* file_checksum_gen_factory = nullptr,
       bool perform_data_verification = false,
-      bool buffered_data_with_checksum = false, uint64_t initial_file_size = 0)
+      bool buffered_data_with_checksum = false, uint64_t initial_file_size = 0,
+      CompactionIOExperiment::JobContextPtr compaction_io_experiment_context =
+          nullptr)
       : file_name_(_file_name),
         writable_file_(std::move(file), io_tracer, _file_name),
         clock_(clock),
@@ -205,7 +209,9 @@ class WritableFileWriter {
         checksum_finalized_(false),
         perform_data_verification_(perform_data_verification),
         buffered_data_crc32c_checksum_(0),
-        buffered_data_with_checksum_(buffered_data_with_checksum) {
+        buffered_data_with_checksum_(buffered_data_with_checksum),
+        compaction_io_experiment_context_(
+            std::move(compaction_io_experiment_context)) {
     temperature_ = options.temperature;
     assert(!use_direct_io() || max_buffer_size_ > 0);
     TEST_SYNC_POINT_CALLBACK("WritableFileWriter::WritableFileWriter:0",
@@ -264,9 +270,11 @@ class WritableFileWriter {
 
   IOStatus Flush(const IOOptions& opts);
 
-  IOStatus Close(const IOOptions& opts);
+  IOStatus Close(const IOOptions& opts,
+                 uint64_t* finalization_micros = nullptr);
 
-  IOStatus Sync(const IOOptions& opts, bool use_fsync);
+  IOStatus Sync(const IOOptions& opts, bool use_fsync,
+                uint64_t* sync_micros = nullptr);
 
   // Sync only the data that was already Flush()ed. Safe to call concurrently
   // with Append() and Flush(). If !writable_file_->IsSyncThreadSafe(),

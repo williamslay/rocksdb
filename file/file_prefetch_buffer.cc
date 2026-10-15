@@ -96,11 +96,9 @@ Status FilePrefetchBuffer::Read(BufferInfo* buf, const IOOptions& opts,
                                 uint64_t start_offset, bool use_fs_buffer) {
   Slice result;
   Status s;
-  CompactionIOExperiment* experiment =
-      compaction_io_experiment_enabled_ ? CompactionIOExperiment::Active()
-                                        : nullptr;
-  const uint64_t start_micros = experiment != nullptr ? experiment->NowMicros()
-                                                      : 0;
+  auto experiment = compaction_io_experiment_context_;
+  const uint64_t start_micros =
+      experiment != nullptr ? experiment->NowMicros() : 0;
   char* to_buf = nullptr;
   if (use_fs_buffer) {
     s = FSBufferDirectRead(reader, buf, opts, start_offset + aligned_useful_len,
@@ -112,8 +110,8 @@ Status FilePrefetchBuffer::Read(BufferInfo* buf, const IOOptions& opts,
   }
 
   if (experiment != nullptr) {
-    experiment->RecordSynchronousRead(
-        read_len, result.size(), experiment->NowMicros() - start_micros);
+    experiment->RecordSynchronousRead(read_len, result.size(),
+                                      experiment->NowMicros() - start_micros);
   }
 
 #ifndef NDEBUG
@@ -160,28 +158,38 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
   req.offset = start_offset;
   req.result = result;
   req.scratch = buf->buffer_.BufferStart();
-  buf->async_req_len_ = req.len;
   TEST_SYNC_POINT_CALLBACK("FilePrefetchBuffer::ReadAsync:RequestLength",
                            &req.len);
+  buf->async_req_len_ = req.len;
+  TEST_SYNC_POINT_CALLBACK("FilePrefetchBuffer::ReadAsync:Request", &req);
 
-  CompactionIOExperiment* experiment =
-      compaction_io_experiment_enabled_ ? CompactionIOExperiment::Active()
-                                        : nullptr;
-  const uint64_t start_micros = experiment != nullptr ? experiment->NowMicros()
-                                                      : 0;
+  auto experiment = compaction_io_experiment_context_;
+  auto input_async_token = experiment != nullptr
+                               ? experiment->BeginInputAsyncRead(req.len)
+                               : nullptr;
+  std::atomic_store(&buf->compaction_io_experiment_context_, experiment);
+  std::atomic_store(&buf->input_async_token_, input_async_token);
+  const uint64_t start_micros =
+      experiment != nullptr ? experiment->NowMicros() : 0;
   if (experiment != nullptr) {
     experiment->RecordAsynchronousReadIssued(read_len);
     buf->compaction_io_experiment_start_micros_ = start_micros;
     buf->compaction_io_experiment_read_in_progress_ = true;
-    buf->compaction_io_experiment_ready_ = false;
+    buf->async_callback_pending_ = true;
+    buf->compaction_io_experiment_ready_.store(false,
+                                               std::memory_order_release);
   }
 
   Status s = reader->ReadAsync(req, opts, fp, buf, &(buf->io_handle_),
                                &(buf->del_fn_), /*aligned_buf =*/nullptr);
   req.status.PermitUncheckedError();
+  if (experiment != nullptr) {
+    experiment->ResolveInputAsyncSubmission(input_async_token, s.ok(),
+                                            s.IsNotSupported());
+  }
   if (s.ok()) {
     if (experiment == nullptr ||
-        buf->compaction_io_experiment_read_in_progress_) {
+        buf->async_callback_pending_.load(std::memory_order_acquire)) {
       buf->async_read_in_progress_ = true;
     }
     if (usage_ == FilePrefetchBufferUsage::kUserScanPrefetch) {
@@ -195,7 +203,14 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
         buf->compaction_io_experiment_read_in_progress_) {
       experiment->RecordAsynchronousReadRejected(read_len);
       buf->compaction_io_experiment_read_in_progress_ = false;
-      buf->compaction_io_experiment_ready_ = false;
+      buf->async_callback_pending_ = false;
+      buf->compaction_io_experiment_ready_.store(false,
+                                                 std::memory_order_release);
+      std::atomic_store(&buf->compaction_io_experiment_context_,
+                        CompactionIOExperiment::JobContextPtr());
+      std::atomic_store(
+          &buf->input_async_token_,
+          CompactionIOExperiment::JobContext::InputAsyncTokenPtr());
     }
     const uint64_t sync_start_micros =
         experiment != nullptr ? experiment->NowMicros() : 0;
@@ -215,7 +230,13 @@ Status FilePrefetchBuffer::ReadAsync(BufferInfo* buf, const IOOptions& opts,
              buf->compaction_io_experiment_read_in_progress_) {
     experiment->RecordAsynchronousReadRejected(read_len);
     buf->compaction_io_experiment_read_in_progress_ = false;
-    buf->compaction_io_experiment_ready_ = false;
+    buf->async_callback_pending_ = false;
+    buf->compaction_io_experiment_ready_.store(false,
+                                               std::memory_order_release);
+    std::atomic_store(&buf->compaction_io_experiment_context_,
+                      CompactionIOExperiment::JobContextPtr());
+    std::atomic_store(&buf->input_async_token_,
+                      CompactionIOExperiment::JobContext::InputAsyncTokenPtr());
   }
   return s;
 }
@@ -409,16 +430,16 @@ void FilePrefetchBuffer::ClearOutdatedData(uint64_t offset, size_t length) {
 
 Status FilePrefetchBuffer::PollIfNeeded(uint64_t offset, size_t length) {
   BufferInfo* buf = GetFirstBuffer();
-  CompactionIOExperiment* experiment =
-      compaction_io_experiment_enabled_ ? CompactionIOExperiment::Active()
-                                        : nullptr;
+  auto experiment = std::atomic_load(&buf->compaction_io_experiment_context_);
 
   if (buf->async_read_in_progress_ && fs_ != nullptr) {
     if (buf->io_handle_ != nullptr) {
       const uint64_t demand_micros =
           experiment != nullptr ? experiment->NowMicros() : 0;
+      TEST_SYNC_POINT("FilePrefetchBuffer::PollIfNeeded:BeforeReadyCheck");
       const bool was_waiting =
-          experiment != nullptr && !buf->compaction_io_experiment_ready_;
+          experiment != nullptr &&
+          !buf->compaction_io_experiment_ready_.load(std::memory_order_acquire);
       // Wait for prefetch data to complete.
       // No mutex is needed as async_read_in_progress behaves as mutex and is
       // updated by main thread only.
@@ -432,7 +453,7 @@ Status FilePrefetchBuffer::PollIfNeeded(uint64_t offset, size_t length) {
       if (!io_s.ok()) {
         // On Poll failure, clean up the handle and abort.
         // DestroyAndClearIOHandle also sets async_read_in_progress_ to false.
-        DestroyAndClearIOHandle(buf);
+        DestroyAndClearIOHandle(buf, false);
         return io_s;
       }
       if (experiment != nullptr) {
@@ -636,7 +657,8 @@ Status FilePrefetchBuffer::HandleOverlappingAsyncData(
     // previous buffer end offset and previous buffer has to go for sync
     // prefetching.
 
-    if (tmp_offset + tmp_length <= next_buf->offset_ + second_size) {
+    if (tmp_offset + tmp_length <= next_buf->offset_ + second_size &&
+        !IsAtOrBeyondFileSize(start_offset)) {
       AllocateBuffer();
       BufferInfo* new_buf = GetLastBuffer();
       size_t read_len = 0;
@@ -863,10 +885,9 @@ bool FilePrefetchBuffer::TryReadFromCacheUntracked(
   assert(!for_compaction || num_buffers_ == 1 ||
          compaction_io_experiment_enabled_);
 
-  CompactionIOExperiment* experiment =
-      (for_compaction && compaction_io_experiment_enabled_)
-          ? CompactionIOExperiment::Active()
-          : nullptr;
+  auto experiment = for_compaction && compaction_io_experiment_enabled_
+                        ? compaction_io_experiment_context_
+                        : nullptr;
   if (experiment != nullptr) {
     experiment->RecordConsumerDemand(n);
   }
@@ -979,24 +1000,36 @@ bool FilePrefetchBuffer::TryReadFromCacheUntracked(
 void FilePrefetchBuffer::PrefetchAsyncCallback(FSReadRequest& req,
                                                void* cb_arg) {
   BufferInfo* buf = static_cast<BufferInfo*>(cb_arg);
+  struct CallbackCompletion {
+    BufferInfo* buffer;
+    ~CallbackCompletion() {
+      buffer->async_callback_pending_.store(false, std::memory_order_release);
+    }
+  } callback_completion{buf};
 
-  CompactionIOExperiment* experiment =
-      compaction_io_experiment_enabled_ ? CompactionIOExperiment::Active()
-                                        : nullptr;
-  if (buf->compaction_io_experiment_read_in_progress_) {
+  auto experiment = std::atomic_load(&buf->compaction_io_experiment_context_);
+  auto input_async_token = std::atomic_load(&buf->input_async_token_);
+  if (buf->compaction_io_experiment_read_in_progress_.exchange(
+          false, std::memory_order_acq_rel)) {
+    TEST_SYNC_POINT_CALLBACK(
+        "FilePrefetchBuffer::PrefetchAsyncCallback:AfterTerminalClaim", buf);
     if (experiment != nullptr) {
       if (req.status.ok()) {
         const uint64_t completion_micros = experiment->NowMicros();
         experiment->RecordAsynchronousReadCompleted(
             req.result.size(),
             completion_micros - buf->compaction_io_experiment_start_micros_);
+        experiment->RecordInputAsyncTerminal(input_async_token,
+                                             req.result.size(), true, false);
         buf->compaction_io_experiment_completion_micros_ = completion_micros;
       } else {
         experiment->RecordAsynchronousReadAborted();
+        experiment->RecordInputAsyncTerminal(input_async_token, 0, false,
+                                             req.status.IsAborted());
       }
     }
-    buf->compaction_io_experiment_read_in_progress_ = false;
-    buf->compaction_io_experiment_ready_ = req.status.ok();
+    buf->compaction_io_experiment_ready_.store(req.status.ok(),
+                                               std::memory_order_release);
   }
 
 #ifndef NDEBUG
@@ -1170,6 +1203,9 @@ Status FilePrefetchBuffer::PrefetchRemBuffers(const IOOptions& opts,
   while (NumBuffersAllocated() < num_buffers_) {
     BufferInfo* prev_buf = GetLastBuffer();
     uint64_t start_offset2 = prev_buf->initial_end_offset_;
+    if (IsAtOrBeyondFileSize(start_offset2)) {
+      break;
+    }
 
     AllocateBuffer();
     BufferInfo* new_buf = GetLastBuffer();

@@ -4212,7 +4212,8 @@ TEST_F(TestAsyncRead, ReadAsyncQueueFull) {
 void TestAbortIOWithRequests(
     Env* env, size_t file_size,
     const std::vector<std::pair<uint64_t, size_t>>& read_specs,
-    bool use_direct_io = false, int iterations = 1) {
+    bool use_direct_io = false, int iterations = 1,
+    size_t* aborted_callbacks_out = nullptr) {
 #if defined(ROCKSDB_IOURING_PRESENT)
   fprintf(stderr,
           "TestAbortIOWithRequests: file_size=%zu, num_reads=%zu, "
@@ -4249,6 +4250,8 @@ void TestAbortIOWithRequests(
     ASSERT_OK(wfile->Close(IOOptions(), nullptr));
   }
 
+  size_t aborted_callbacks_total = 0;
+  std::atomic<bool> callback_metadata_valid{true};
   for (int iter = 0; iter < iterations; iter++) {
     // 2. Submit ReadAsync requests and immediately abort
     {
@@ -4265,6 +4268,7 @@ void TestAbortIOWithRequests(
       std::vector<size_t> vals;
       IOHandleDeleter del_fn;
       std::atomic<int> callbacks_invoked{0};
+      std::atomic<size_t> aborted_callbacks{0};
 
       // Initialize read requests from specs
       for (size_t i = 0; i < num_reads; i++) {
@@ -4279,6 +4283,15 @@ void TestAbortIOWithRequests(
       std::function<void(FSReadRequest&, void*)> callback =
           [&](FSReadRequest& req, void* cb_arg) {
             size_t i = *(reinterpret_cast<size_t*>(cb_arg));
+            if (req.offset != read_specs[i].first ||
+                req.len != read_specs[i].second ||
+                req.scratch != data[i].get() ||
+                (req.status.IsAborted() && req.result.size() != 0)) {
+              callback_metadata_valid.store(false);
+            }
+            if (req.status.IsAborted()) {
+              aborted_callbacks++;
+            }
             reqs[i].status = req.status;
             callbacks_invoked++;
           };
@@ -4315,6 +4328,7 @@ void TestAbortIOWithRequests(
         ASSERT_TRUE(h->is_finished);
       }
       ASSERT_EQ(callbacks_invoked.load(), static_cast<int>(num_reads));
+      aborted_callbacks_total += aborted_callbacks.load();
 
       // Clean up handles
       for (size_t i = 0; i < num_reads; i++) {
@@ -4329,6 +4343,10 @@ void TestAbortIOWithRequests(
 
   fprintf(stderr, "TestAbortIOWithRequests: completed %d iterations\n",
           iterations);
+  EXPECT_TRUE(callback_metadata_valid.load());
+  if (aborted_callbacks_out != nullptr) {
+    *aborted_callbacks_out = aborted_callbacks_total;
+  }
 #else
   fprintf(stderr,
           "TestAbortIOWithRequests: SKIPPED (ROCKSDB_IOURING_PRESENT not "
@@ -4338,6 +4356,9 @@ void TestAbortIOWithRequests(
   (void)read_specs;
   (void)use_direct_io;
   (void)iterations;
+  if (aborted_callbacks_out != nullptr) {
+    *aborted_callbacks_out = 0;
+  }
 #endif
 }
 
@@ -4409,8 +4430,12 @@ TEST_F(TestAsyncRead, AbortIOReversedHandles) {
       {1024 * 1024, 4096},  // 4KB read at 1MB offset
   };
   // 2MB file, Direct I/O enabled, 100 iterations
-  TestAbortIOWithRequests(env_, 2 * 1024 * 1024, specs,
-                          /*use_direct_io=*/true, /*iterations=*/100);
+  size_t aborted_callbacks = 0;
+  TestAbortIOWithRequests(env_, 2 * 1024 * 1024, specs, /*use_direct_io=*/true,
+                          /*iterations=*/100, &aborted_callbacks);
+#if defined(ROCKSDB_IOURING_PRESENT)
+  EXPECT_GT(aborted_callbacks, 0U);
+#endif
 }
 
 // Test for bug fix: AbortIO with partial handles should correctly handle

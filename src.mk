@@ -745,6 +745,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/options_util.cc                               \
   java/rocksjni/persistent_cache.cc                           \
   java/rocksjni/ratelimiterjni.cc                             \
+  java/rocksjni/r3_compaction_io_experiment.cc                 \
   java/rocksjni/remove_emptyvalue_compactionfilterjni.cc      \
   java/rocksjni/cassandra_compactionfilterjni.cc              \
   java/rocksjni/cassandra_value_operator.cc                   \

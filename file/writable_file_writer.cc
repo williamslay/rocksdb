@@ -249,8 +249,12 @@ IOStatus WritableFileWriter::Pad(const IOOptions& opts, const size_t pad_bytes,
   return IOStatus::OK();
 }
 
-IOStatus WritableFileWriter::Close(const IOOptions& opts) {
+IOStatus WritableFileWriter::Close(const IOOptions& opts,
+                                   uint64_t* finalization_micros) {
   IOOptions io_options = FinalizeIOOptions(opts);
+  if (finalization_micros != nullptr) {
+    *finalization_micros = 0;
+  }
   if (seen_error()) {
     IOStatus interim;
     if (writable_file_.get() != nullptr) {
@@ -277,6 +281,18 @@ IOStatus WritableFileWriter::Close(const IOOptions& opts) {
 
   IOStatus s;
   s = Flush(io_options);  // flush cache to OS
+
+  auto experiment =
+      finalization_micros != nullptr &&
+              io_options.io_activity == Env::IOActivity::kCompaction
+          ? compaction_io_experiment_context_
+          : nullptr;
+  uint64_t finalization_start_micros = 0;
+  bool finalization_timing_started = false;
+  if (experiment != nullptr && use_direct_io()) {
+    finalization_start_micros = experiment->NowMicros();
+    finalization_timing_started = true;
+  }
 
   IOStatus interim;
   // In direct I/O mode we write whole pages so
@@ -322,6 +338,10 @@ IOStatus WritableFileWriter::Close(const IOOptions& opts) {
 
   TEST_KILL_RANDOM("WritableFileWriter::Close:0");
   {
+    if (experiment != nullptr && !finalization_timing_started) {
+      finalization_start_micros = experiment->NowMicros();
+      finalization_timing_started = true;
+    }
     FileOperationInfo::StartTimePoint start_ts;
     if (ShouldNotifyListeners()) {
       start_ts = FileOperationInfo::StartNow();
@@ -334,6 +354,9 @@ IOStatus WritableFileWriter::Close(const IOOptions& opts) {
         NotifyOnIOError(interim, FileOperationType::kClose, file_name());
       }
     }
+  }
+  if (experiment != nullptr && finalization_timing_started) {
+    *finalization_micros = experiment->NowMicros() - finalization_start_micros;
   }
   if (!interim.ok() && s.ok()) {
     s = interim;
@@ -466,7 +489,11 @@ IOStatus WritableFileWriter::PrepareIOOptions(const WriteOptions& wo,
   return PrepareIOFromWriteOptions(wo, opts);
 }
 
-IOStatus WritableFileWriter::Sync(const IOOptions& opts, bool use_fsync) {
+IOStatus WritableFileWriter::Sync(const IOOptions& opts, bool use_fsync,
+                                  uint64_t* sync_micros) {
+  if (sync_micros != nullptr) {
+    *sync_micros = 0;
+  }
   if (seen_error()) {
     return GetWriterHasPreviousErrorStatus();
   }
@@ -479,7 +506,16 @@ IOStatus WritableFileWriter::Sync(const IOOptions& opts, bool use_fsync) {
   }
   TEST_KILL_RANDOM("WritableFileWriter::Sync:0");
   if (!use_direct_io() && pending_sync_) {
+    auto experiment = sync_micros != nullptr && io_options.io_activity ==
+                                                    Env::IOActivity::kCompaction
+                          ? compaction_io_experiment_context_
+                          : nullptr;
+    const uint64_t start_micros =
+        experiment != nullptr ? experiment->NowMicros() : 0;
     s = SyncInternal(io_options, use_fsync);
+    if (experiment != nullptr) {
+      *sync_micros = experiment->NowMicros() - start_micros;
+    }
     if (!s.ok()) {
       set_seen_error(s);
       return s;
@@ -589,13 +625,9 @@ IOStatus WritableFileWriter::WriteBuffered(const IOOptions& opts,
   DataVerificationInfo v_info;
   char checksum_buf[sizeof(uint32_t)];
   Env::IOPriority rate_limiter_priority_used = opts.rate_limiter_priority;
-  CompactionIOExperiment* experiment =
-      opts.io_activity == Env::IOActivity::kCompaction
-          ? CompactionIOExperiment::Active()
-          : nullptr;
-  if (experiment != nullptr && !experiment->IsCompactionJobActive()) {
-    experiment = nullptr;
-  }
+  auto experiment = opts.io_activity == Env::IOActivity::kCompaction
+                        ? compaction_io_experiment_context_
+                        : nullptr;
 
   while (left > 0) {
     size_t allowed = left;
@@ -708,10 +740,9 @@ IOStatus WritableFileWriter::WriteBufferedWithChecksum(const IOOptions& opts,
       data_size -= tmp_size;
     }
   }
-  CompactionIOExperiment* experiment =
-      opts.io_activity == Env::IOActivity::kCompaction
-          ? CompactionIOExperiment::Active()
-          : nullptr;
+  auto experiment = opts.io_activity == Env::IOActivity::kCompaction
+                        ? compaction_io_experiment_context_
+                        : nullptr;
 
   {
     IOSTATS_TIMER_GUARD(write_nanos);
@@ -836,10 +867,9 @@ IOStatus WritableFileWriter::WriteDirect(const IOOptions& opts) {
   DataVerificationInfo v_info;
   char checksum_buf[sizeof(uint32_t)];
   Env::IOPriority rate_limiter_priority_used = opts.rate_limiter_priority;
-  CompactionIOExperiment* experiment =
-      opts.io_activity == Env::IOActivity::kCompaction
-          ? CompactionIOExperiment::Active()
-          : nullptr;
+  auto experiment = opts.io_activity == Env::IOActivity::kCompaction
+                        ? compaction_io_experiment_context_
+                        : nullptr;
 
   while (left > 0) {
     // Check how much is allowed
@@ -949,10 +979,9 @@ IOStatus WritableFileWriter::WriteDirectWithChecksum(const IOOptions& opts) {
   size_t left = buf_.CurrentSize();
   DataVerificationInfo v_info;
   char checksum_buf[sizeof(uint32_t)];
-  CompactionIOExperiment* experiment =
-      opts.io_activity == Env::IOActivity::kCompaction
-          ? CompactionIOExperiment::Active()
-          : nullptr;
+  auto experiment = opts.io_activity == Env::IOActivity::kCompaction
+                        ? compaction_io_experiment_context_
+                        : nullptr;
 
   Env::IOPriority rate_limiter_priority_used = opts.rate_limiter_priority;
   // Check how much is allowed. Here, we loop until the rate limiter allows to

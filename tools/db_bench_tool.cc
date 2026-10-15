@@ -10055,7 +10055,8 @@ class Benchmark {
     db_with_cfh.db->DefaultColumnFamily()->GetDescriptor(&cfDesc);
     options.output_file_size_limit = cfDesc.options.target_file_size_base;
 
-    CompactionIOExperiment* experiment = CompactionIOExperiment::Active();
+    std::shared_ptr<CompactionIOExperiment> experiment =
+        CompactionIOExperiment::Active();
     const uint64_t compaction_start_nanos =
         experiment != nullptr ? FLAGS_env->GetSystemClock()->NowNanos() : 0;
     const uint64_t cpu_start_micros =

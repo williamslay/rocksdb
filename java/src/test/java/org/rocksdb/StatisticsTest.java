@@ -35,6 +35,26 @@ public class StatisticsTest {
   }
 
   @Test
+  public void exceptMutexStatsLevelRecordsReadHistogram() throws RocksDBException {
+    try (final Statistics statistics = new Statistics()) {
+      statistics.setStatsLevel(StatsLevel.EXCEPT_TIME_FOR_MUTEX);
+      try (final Options opt = new Options().setStatistics(statistics).setCreateIfMissing(true);
+           final RocksDB db = RocksDB.open(opt, dbFolder.getRoot().getAbsolutePath())) {
+        final byte[] key = "stats-key".getBytes(StandardCharsets.UTF_8);
+        db.put(key, "stats-value".getBytes(StandardCharsets.UTF_8));
+        statistics.reset();
+        assertThat(statistics.getTickerCount(TickerType.BYTES_READ)).isEqualTo(0);
+        db.get(key);
+        assertThat(statistics.getTickerCount(TickerType.BYTES_READ)).isGreaterThan(0);
+      }
+
+      assertThat(statistics.statsLevel()).isEqualTo(StatsLevel.EXCEPT_TIME_FOR_MUTEX);
+      assertThat(statistics.getHistogramData(HistogramType.BYTES_PER_READ).getCount())
+          .isGreaterThan(0);
+    }
+  }
+
+  @Test
   public void getTickerCount() throws RocksDBException {
     try (final Statistics statistics = new Statistics();
          final Options opt = new Options()

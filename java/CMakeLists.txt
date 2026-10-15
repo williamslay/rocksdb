@@ -61,6 +61,7 @@ set(JNI_NATIVE_SOURCES
         rocksjni/options_util.cc
         rocksjni/persistent_cache.cc
         rocksjni/ratelimiterjni.cc
+        rocksjni/r3_compaction_io_experiment.cc
         rocksjni/remove_emptyvalue_compactionfilterjni.cc
         rocksjni/restorejni.cc
         rocksjni/rocks_callback_object.cc

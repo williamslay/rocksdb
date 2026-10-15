@@ -12,8 +12,10 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 
 #include "file/compaction_io_experiment.h"
 #include "file/random_access_file_reader.h"
@@ -37,6 +39,8 @@ class RandomAccessFileReader;
 
 struct ReadaheadParams {
   ReadaheadParams() {}
+
+  std::optional<uint64_t> file_size;
 
   // The initial readahead size.
   size_t initial_readahead_size = 0;
@@ -66,10 +70,15 @@ struct BufferInfo {
     buffer_.Clear();
     initial_end_offset_ = 0;
     async_req_len_ = 0;
+    std::atomic_store(&compaction_io_experiment_context_,
+                      CompactionIOExperiment::JobContextPtr());
+    std::atomic_store(&input_async_token_,
+                      CompactionIOExperiment::JobContext::InputAsyncTokenPtr());
     compaction_io_experiment_start_micros_ = 0;
     compaction_io_experiment_completion_micros_ = 0;
     compaction_io_experiment_read_in_progress_ = false;
-    compaction_io_experiment_ready_ = false;
+    async_callback_pending_ = false;
+    compaction_io_experiment_ready_.store(false, std::memory_order_release);
   }
 
   AlignedBuffer buffer_;
@@ -79,6 +88,8 @@ struct BufferInfo {
   // Below parameters are used in case of async read flow.
   // Length requested for in ReadAsync.
   size_t async_req_len_ = 0;
+  CompactionIOExperiment::JobContextPtr compaction_io_experiment_context_;
+  CompactionIOExperiment::JobContext::InputAsyncTokenPtr input_async_token_;
 
   // async_read_in_progress can be used as mutex. Callback can update the buffer
   // and its size but async_read_in_progress is only set by main thread.
@@ -86,8 +97,9 @@ struct BufferInfo {
 
   uint64_t compaction_io_experiment_start_micros_ = 0;
   uint64_t compaction_io_experiment_completion_micros_ = 0;
-  bool compaction_io_experiment_read_in_progress_ = false;
-  bool compaction_io_experiment_ready_ = false;
+  std::atomic<bool> compaction_io_experiment_read_in_progress_{false};
+  std::atomic<bool> async_callback_pending_{false};
+  std::atomic<bool> compaction_io_experiment_ready_{false};
 
   // io_handle is allocated and used by underlying file system in case of
   // asynchronous reads.
@@ -200,10 +212,13 @@ class FilePrefetchBuffer {
       SystemClock* clock = nullptr, Statistics* stats = nullptr,
       const std::function<void(bool, uint64_t&, uint64_t&)>& cb = nullptr,
       FilePrefetchBufferUsage usage = FilePrefetchBufferUsage::kUnknown,
-      bool compaction_io_experiment_enabled = false)
+      bool compaction_io_experiment_enabled = false,
+      CompactionIOExperiment::JobContextPtr compaction_io_experiment_context =
+          nullptr)
       : readahead_size_(readahead_params.initial_readahead_size),
         initial_auto_readahead_size_(readahead_params.initial_readahead_size),
         max_readahead_size_(readahead_params.max_readahead_size),
+        file_size_(readahead_params.file_size),
         min_offset_read_(std::numeric_limits<size_t>::max()),
         enable_(enable),
         track_min_offset_(track_min_offset),
@@ -219,8 +234,13 @@ class FilePrefetchBuffer {
         stats_(stats),
         usage_(usage),
         readaheadsize_cb_(cb),
-        compaction_io_experiment_enabled_(
-            compaction_io_experiment_enabled),
+        compaction_io_experiment_enabled_(compaction_io_experiment_enabled),
+        compaction_io_experiment_context_(
+            compaction_io_experiment_context != nullptr
+                ? std::move(compaction_io_experiment_context)
+            : compaction_io_experiment_enabled
+                ? CompactionIOExperiment::CurrentOrActiveJobContext()
+                : nullptr),
         num_buffers_(readahead_params.num_buffers) {
     assert((num_file_reads_ >= num_file_reads_for_auto_readahead_ + 1) ||
            (num_file_reads_ == 0));
@@ -467,6 +487,10 @@ class FilePrefetchBuffer {
     return (prev_len_ == 0 || (prev_offset_ + prev_len_ == offset));
   }
 
+  bool IsAtOrBeyondFileSize(uint64_t offset) const {
+    return file_size_.has_value() && offset >= *file_size_;
+  }
+
   // Called in case of implicit auto prefetching.
   void ResetValues() {
     num_file_reads_ = 1;
@@ -557,15 +581,23 @@ class FilePrefetchBuffer {
     return s;
   }
 
-  void DestroyAndClearIOHandle(BufferInfo* buf) {
-    if (buf->compaction_io_experiment_read_in_progress_) {
-      if (auto* experiment = CompactionIOExperiment::Active();
-          experiment != nullptr) {
+  void DestroyAndClearIOHandle(BufferInfo* buf, bool aborted = true) {
+    auto experiment = std::atomic_load(&buf->compaction_io_experiment_context_);
+    auto input_async_token = std::atomic_load(&buf->input_async_token_);
+    if (buf->compaction_io_experiment_read_in_progress_.exchange(
+            false, std::memory_order_acq_rel)) {
+      if (experiment != nullptr) {
         experiment->RecordAsynchronousReadAborted();
+        experiment->RecordInputAsyncTerminal(input_async_token, 0, false,
+                                             aborted);
       }
-      buf->compaction_io_experiment_read_in_progress_ = false;
-      buf->compaction_io_experiment_ready_ = false;
+      buf->compaction_io_experiment_ready_.store(false,
+                                                 std::memory_order_release);
     }
+    std::atomic_store(&buf->compaction_io_experiment_context_,
+                      CompactionIOExperiment::JobContextPtr());
+    std::atomic_store(&buf->input_async_token_,
+                      CompactionIOExperiment::JobContext::InputAsyncTokenPtr());
     if (buf->io_handle_ != nullptr && buf->del_fn_ != nullptr) {
       buf->del_fn_(buf->io_handle_);
       buf->io_handle_ = nullptr;
@@ -695,6 +727,7 @@ class FilePrefetchBuffer {
   // FilePrefetchBuffer object won't be created from Iterator flow if
   // max_readahead_size_ = 0.
   size_t max_readahead_size_;
+  std::optional<uint64_t> file_size_;
 
   // The minimum `offset` ever passed to TryReadFromCache().
   size_t min_offset_read_;
@@ -730,6 +763,7 @@ class FilePrefetchBuffer {
   std::function<void(bool, uint64_t&, uint64_t&)> readaheadsize_cb_;
 
   bool compaction_io_experiment_enabled_;
+  CompactionIOExperiment::JobContextPtr compaction_io_experiment_context_;
 
   // num_buffers_ is the number of buffers maintained by FilePrefetchBuffer to
   // prefetch the data at a time.
