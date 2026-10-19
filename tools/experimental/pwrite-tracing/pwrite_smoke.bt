@@ -1,0 +1,57 @@
+#!/usr/bin/env bpftrace
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// This source code is licensed under both the GPLv2 (found in the
+// COPYING file in the root directory) and Apache 2.0 License
+// (found in the LICENSE.Apache file in the root directory).
+
+BEGIN
+{
+  printf("TRACE_BEGIN,%llu\n", nsecs);
+  printf("event,enter_ns,exit_ns,tid,fd,offset,requested,return,wall_ns\n");
+}
+
+tracepoint:syscalls:sys_enter_pwrite64
+/ pid == $1 /
+{
+  @entry_count++;
+  if (@active[tid]) {
+    @duplicate_entry++;
+  } else {
+    @active[tid] = 1;
+    @enter_ns[tid] = nsecs;
+    @fd[tid] = args->fd;
+    @offset[tid] = args->pos;
+    @requested[tid] = args->count;
+    @active_count++;
+  }
+}
+
+tracepoint:syscalls:sys_exit_pwrite64
+/ pid == $1 /
+{
+  @exit_count++;
+  if (!@active[tid]) {
+    @unmatched_exit++;
+  } else {
+    $exit = nsecs;
+    printf("pwrite,%llu,%llu,%d,%d,%lld,%llu,%lld,%llu\n",
+      @enter_ns[tid], $exit, tid, @fd[tid], @offset[tid],
+      @requested[tid], args->ret, $exit - @enter_ns[tid]);
+    delete(@active[tid]);
+    delete(@enter_ns[tid]);
+    delete(@fd[tid]);
+    delete(@offset[tid]);
+    delete(@requested[tid]);
+    @active_count--;
+  }
+}
+
+END
+{
+  printf("TRACE_END,%llu\n", nsecs);
+  printf("DIAG,pwrite_entry_count,%llu\n", @entry_count);
+  printf("DIAG,pwrite_exit_count,%llu\n", @exit_count);
+  printf("DIAG,duplicate_syscall_entry,%llu\n", @duplicate_entry);
+  printf("DIAG,unmatched_syscall_exit,%llu\n", @unmatched_exit);
+  printf("DIAG,right_censored_active_syscalls,%llu\n", @active_count);
+}

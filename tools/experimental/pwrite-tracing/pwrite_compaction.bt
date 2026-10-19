@@ -1,0 +1,214 @@
+#!/usr/bin/env bpftrace
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// This source code is licensed under both the GPLv2 (found in the
+// COPYING file in the root directory) and Apache 2.0 License
+// (found in the LICENSE.Apache file in the root directory).
+
+BEGIN
+{
+  printf("TRACE_BEGIN,%llu\n", nsecs);
+  printf("event,enter_ns,exit_ns,tid,fd,offset,requested,return,wall_ns,offcpu_ns,offcpu_state0_ns,offcpu_state_nonzero_ns,io_wait_proxy_ns,job_depth\n");
+}
+
+/* Function probes identify thread and time, not a RocksDB job ID. */
+uprobe:$2:_ZN7rocksdb13CompactionJob3RunEv
+/ pid == $1 /
+{
+  $depth = @job_depth[tid] + 1;
+  $enter = nsecs;
+  @job_depth[tid] = $depth;
+  @job_start[tid, $depth] = $enter;
+  @job_active_count++;
+  printf("JOB_ENTER,%llu,%d,%d\n", $enter, tid, $depth);
+}
+
+uretprobe:$2:_ZN7rocksdb13CompactionJob3RunEv
+/ pid == $1 /
+{
+  if (@job_depth[tid] > 0) {
+    $depth = @job_depth[tid];
+    $enter = @job_start[tid, $depth];
+    $exit = nsecs;
+    printf("JOB_EXIT,%llu,%llu,%d,%d,%llu\n", $enter, $exit, tid,
+      $depth, $exit - $enter);
+    printf("JOB_SCOPE,%llu,%llu,%d,%d,%llu\n", $enter, $exit, tid,
+      $depth, $exit - $enter);
+    delete(@job_start[tid, $depth]);
+    @job_depth[tid] = $depth - 1;
+    @job_active_count--;
+  } else {
+    @unmatched_job_return++;
+  }
+}
+
+tracepoint:syscalls:sys_enter_pwrite64
+/ pid == $1 /
+{
+  $tid = tid;
+  @pwrite_entry_count++;
+  if (@job_depth[$tid] > 0) {
+    if (@active[$tid]) {
+      @duplicate_entry++;
+    } else {
+      @active[$tid] = 1;
+      @active_count++;
+      @enter_ns[$tid] = nsecs;
+      @fd[$tid] = args->fd;
+      @offset[$tid] = args->pos;
+      @requested[$tid] = args->count;
+      @offcpu_ns[$tid] = (uint64)0;
+      @state0_ns[$tid] = (uint64)0;
+      @state_nonzero_ns[$tid] = (uint64)0;
+      @io_proxy_ns[$tid] = (uint64)0;
+      @io_depth[$tid] = 0;
+    }
+  } else {
+    @pwrite_outside_scope_entry_count++;
+  }
+}
+
+tracepoint:sched:sched_switch
+{
+  $prev = args->prev_pid;
+  $next = args->next_pid;
+  if (@active[$prev]) {
+    if (@offcpu_start[$prev]) {
+      @bad_sched_pairing++;
+    } else {
+      @offcpu_start[$prev] = nsecs;
+      @offcpu_state[$prev] = args->prev_state;
+      @offcpu_io_wait[$prev] = @io_depth[$prev] > 0 && args->prev_state != 0;
+      @offcpu_count++;
+    }
+  }
+  if (@active[$next]) {
+    if (@offcpu_start[$next]) {
+      $duration = (uint64)(nsecs - @offcpu_start[$next]);
+      @offcpu_ns[$next] += $duration;
+      @offcpu_by_prev_state[@offcpu_state[$next]] += $duration;
+      if (@offcpu_state[$next] == 0) {
+        @state0_ns[$next] += $duration;
+      } else {
+        @state_nonzero_ns[$next] += $duration;
+      }
+      if (@offcpu_io_wait[$next]) {
+        @io_proxy_ns[$next] += $duration;
+      }
+      delete(@offcpu_start[$next]);
+      delete(@offcpu_state[$next]);
+      delete(@offcpu_io_wait[$next]);
+      @offcpu_count--;
+    } else {
+      @bad_sched_pairing++;
+    }
+  }
+}
+
+kprobe:io_schedule
+/ @active[tid] /
+{
+  @io_schedule_entry_hits++;
+  if (@io_depth[tid] == 0) {
+    @io_depth_active_count++;
+  }
+  @io_depth[tid]++;
+}
+
+kprobe:io_schedule_timeout
+/ @active[tid] /
+{
+  @io_schedule_timeout_entry_hits++;
+  if (@io_depth[tid] == 0) {
+    @io_depth_active_count++;
+  }
+  @io_depth[tid]++;
+}
+
+kretprobe:io_schedule
+/ @active[tid] /
+{
+  @io_schedule_return_hits++;
+  if (@io_depth[tid] > 0) {
+    @io_depth[tid]--;
+    if (@io_depth[tid] == 0) {
+      @io_depth_active_count--;
+    }
+  } else {
+    @depth_underflow++;
+  }
+}
+
+kretprobe:io_schedule_timeout
+/ @active[tid] /
+{
+  @io_schedule_timeout_return_hits++;
+  if (@io_depth[tid] > 0) {
+    @io_depth[tid]--;
+    if (@io_depth[tid] == 0) {
+      @io_depth_active_count--;
+    }
+  } else {
+    @depth_underflow++;
+  }
+}
+
+tracepoint:syscalls:sys_exit_pwrite64
+/ pid == $1 /
+{
+  $tid = tid;
+  @pwrite_exit_count++;
+  if (!@active[$tid]) {
+    @pwrite_outside_scope_exit_count++;
+  } else {
+    $exit = nsecs;
+    if (@io_depth[$tid] != 0) {
+      @nonzero_depth_exit++;
+    }
+    if (@offcpu_start[$tid]) {
+      @bad_sched_pairing++;
+      delete(@offcpu_start[$tid]);
+      delete(@offcpu_state[$tid]);
+      delete(@offcpu_io_wait[$tid]);
+      @offcpu_count--;
+    }
+    printf("pwrite,%llu,%llu,%d,%d,%lld,%llu,%lld,%llu,%llu,%llu,%llu,%llu,%d\n",
+      @enter_ns[$tid], $exit, $tid, @fd[$tid], @offset[$tid],
+      @requested[$tid], args->ret, $exit - @enter_ns[$tid],
+      @offcpu_ns[$tid], @state0_ns[$tid], @state_nonzero_ns[$tid],
+      @io_proxy_ns[$tid], @job_depth[$tid]);
+    delete(@active[$tid]);
+    delete(@enter_ns[$tid]);
+    delete(@fd[$tid]);
+    delete(@offset[$tid]);
+    delete(@requested[$tid]);
+    delete(@offcpu_ns[$tid]);
+    delete(@state0_ns[$tid]);
+    delete(@state_nonzero_ns[$tid]);
+    delete(@io_proxy_ns[$tid]);
+    delete(@io_depth[$tid]);
+    @active_count--;
+  }
+}
+
+END
+{
+  printf("TRACE_END,%llu\n", nsecs);
+  printf("DIAG,duplicate_syscall_entry,%llu\n", @duplicate_entry);
+  printf("DIAG,pwrite_entry_count,%llu\n", @pwrite_entry_count);
+  printf("DIAG,pwrite_exit_count,%llu\n", @pwrite_exit_count);
+  printf("DIAG,pwrite_outside_scope_entry_count,%llu\n", @pwrite_outside_scope_entry_count);
+  printf("DIAG,pwrite_outside_scope_exit_count,%llu\n", @pwrite_outside_scope_exit_count);
+  printf("DIAG,bad_scheduler_pairing,%llu\n", @bad_sched_pairing);
+  printf("DIAG,kprobe_kretprobe_depth_underflow,%llu\n", @depth_underflow);
+  printf("DIAG,nonzero_depth_at_syscall_exit,%llu\n", @nonzero_depth_exit);
+  printf("DIAG,right_censored_active_syscalls,%llu\n", @active_count);
+  printf("DIAG,right_censored_offcpu_states,%llu\n", @offcpu_count);
+  printf("DIAG,right_censored_io_schedule_scopes,%llu\n", @io_depth_active_count);
+  printf("DIAG,io_schedule_entry_hits,%llu\n", @io_schedule_entry_hits);
+  printf("DIAG,io_schedule_return_hits,%llu\n", @io_schedule_return_hits);
+  printf("DIAG,io_schedule_timeout_entry_hits,%llu\n", @io_schedule_timeout_entry_hits);
+  printf("DIAG,io_schedule_timeout_return_hits,%llu\n", @io_schedule_timeout_return_hits);
+  printf("DIAG,unmatched_job_return,%llu\n", @unmatched_job_return);
+  printf("DIAG,right_censored_active_job_scopes,%llu\n", @job_active_count);
+  print(@offcpu_by_prev_state);
+}
